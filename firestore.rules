@@ -1,0 +1,88 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: user must be authenticated (Firebase Anonymous Auth)
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Helper: user must be one of the two registered couple members
+    // stored in /couple/settings.memberUids ({ avinash: uid1, athulya: uid2 })
+    function coupleDoc() {
+      return get(/databases/$(database)/documents/couple/settings).data;
+    }
+
+    function isCoupleMember() {
+      return isSignedIn() && (
+        !exists(/databases/$(database)/documents/couple/settings) ||
+        coupleDoc().memberUids.avinash == request.auth.uid ||
+        coupleDoc().memberUids.athulya == request.auth.uid
+      );
+    }
+
+    // Couple settings & member slot registration
+    // Allows claiming an empty slot or updating if already one of the two couple UIDs
+    match /couple/settings {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && (
+        !('memberUids' in resource.data) ||
+        resource.data.memberUids.avinash == request.auth.uid ||
+        resource.data.memberUids.athulya == request.auth.uid ||
+        resource.data.memberUids.avinash == null ||
+        resource.data.memberUids.athulya == null ||
+        // Allow switching/re-authenticating when caller updates only their claimed slot
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberUids', 'updatedAt'])
+      );
+    }
+
+    // Individual user profiles (only the couple can read; user can write their own doc)
+    match /users/{uid} {
+      allow read: if isCoupleMember();
+      allow write: if isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Presence (online, lastSeen, typing, missYou pulse)
+    match /presence/{memberId} {
+      allow read, write: if isCoupleMember();
+    }
+
+    // Permanent chat messages
+    match /messages/{messageId} {
+      allow read, create, update, delete: if isCoupleMember();
+    }
+
+    // Live 2-player games, invites, history, and custom Truth or Dare cards
+    match /games/{gameId} {
+      allow read, write: if isCoupleMember();
+    }
+
+    match /gameHistory/{entryId} {
+      allow read, create: if isCoupleMember();
+    }
+
+    match /customCards/{cardId} {
+      allow read, create, delete: if isCoupleMember();
+    }
+
+    // Shared photo gallery & relationship milestones
+    match /memories/{memoryId} {
+      allow read, create, update, delete: if isCoupleMember();
+    }
+
+    // WebRTC video/voice call signaling
+    match /calls/{callId} {
+      allow read, write: if isCoupleMember();
+
+      match /offerCandidates/{candidateId} {
+        allow read, write: if isCoupleMember();
+      }
+      match /answerCandidates/{candidateId} {
+        allow read, write: if isCoupleMember();
+      }
+    }
+  }
+}
+

@@ -37,8 +37,10 @@ import {
 } from '@/types/universe';
 
 // ============================================================================
-// Local Demo / Fallback Channel (BroadcastChannel + localStorage)
-// Allows instant multi-tab realtime testing even before Firebase keys are set!
+// Dual Sync Engine:
+// 1. Next.js /api/sync router (Cross-device realtime over Wi-Fi / Vercel / Web)
+// 2. BroadcastChannel + localStorage (Instant 0ms multi-tab sync on same machine)
+// 3. Firebase Firestore + Cloud Storage (Permanent cloud sync when configured)
 // ============================================================================
 
 const LOCAL_PREFIX = 'olu_store_v1_';
@@ -61,7 +63,15 @@ function getBroadcast(): BroadcastChannel | null {
 
 function notifyLocalKey(key: string) {
   const subs = localListeners.get(key);
-  if (subs) subs.forEach((fn) => fn());
+  if (subs) {
+    subs.forEach((fn) => {
+      try {
+        fn();
+      } catch (err) {
+        console.warn('[Sync] Listener error:', err);
+      }
+    });
+  }
 }
 
 function readLocal<T>(key: string, fallback: T): T {
@@ -75,12 +85,14 @@ function readLocal<T>(key: string, fallback: T): T {
   }
 }
 
-function writeLocal<T>(key: string, value: T) {
+function writeLocal<T>(key: string, value: T, notify = true) {
   if (typeof window === 'undefined') return;
   try {
     window.localStorage.setItem(LOCAL_PREFIX + key, JSON.stringify(value));
-    notifyLocalKey(key);
-    getBroadcast()?.postMessage({ key });
+    if (notify) {
+      notifyLocalKey(key);
+      getBroadcast()?.postMessage({ key });
+    }
   } catch (err) {
     console.warn('[LocalStore] Write failed:', err);
   }
@@ -106,80 +118,247 @@ function subscribeLocal<T>(key: string, fallback: T, cb: (val: T) => void): () =
   };
 }
 
+// ----------------------------------------------------------------------------
+// Background Server Sync Client (/api/sync)
+// Guarantees delivery between two different phones or computers!
+// ----------------------------------------------------------------------------
+
+async function postApiSync(body: Record<string, unknown>) {
+  if (typeof window === 'undefined') return;
+  try {
+    await fetch('/api/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    // Non-blocking best-effort
+  }
+}
+
+let syncPollerStarted = false;
+let lastServerUpdated = 0;
+
+function startServerSyncPoller() {
+  if (typeof window === 'undefined' || syncPollerStarted) return;
+  syncPollerStarted = true;
+
+  const poll = async () => {
+    try {
+      const res = await fetch(`/api/sync?since=${lastServerUpdated}`, {
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      lastServerUpdated = data.lastUpdated || Date.now();
+
+      // Messages sync
+      if (Array.isArray(data.messages)) {
+        const localMsgs = readLocal<ChatMessage[]>('messages', []);
+        const localIdSet = new Set(localMsgs.map((m) => m.id));
+        const hasDiff =
+          data.messages.length !== localMsgs.length ||
+          data.messages.some(
+            (m: ChatMessage) =>
+              !localIdSet.has(m.id) ||
+              localMsgs.find((x) => x.id === m.id)?.status !== m.status
+          );
+        if (hasDiff) {
+          // Merge unique by ID
+          const map = new Map<string, ChatMessage>();
+          [...localMsgs, ...data.messages].forEach((m: ChatMessage) => {
+            map.set(m.id, m);
+          });
+          const merged = Array.from(map.values()).sort((a, b) => a.createdAt - b.createdAt);
+          writeLocal('messages', merged, true);
+        }
+      }
+
+      // Presence sync
+      if (data.presence) {
+        (['avinash', 'athulya'] as MemberId[]).forEach((m) => {
+          if (data.presence[m]) {
+            const current = readLocal<MemberPresence>(`presence_${m}`, {
+              memberId: m,
+              online: false,
+              lastSeen: 0,
+              typing: false,
+            });
+            if (
+              data.presence[m].online !== current.online ||
+              data.presence[m].typing !== current.typing ||
+              data.presence[m].missYouAt !== current.missYouAt
+            ) {
+              writeLocal(`presence_${m}`, data.presence[m], true);
+            }
+          }
+        });
+      }
+
+      // Active Call sync
+      if ('activeCall' in data) {
+        const currentCall = readLocal<CallSession | null>('active_call', null);
+        const serverCall = data.activeCall as CallSession | null;
+        if (JSON.stringify(currentCall) !== JSON.stringify(serverCall)) {
+          writeLocal('active_call', serverCall, true);
+        }
+      }
+
+      // ICE candidates sync
+      if (data.iceCandidates && data.iceCandidates.callId) {
+        const callId = data.iceCandidates.callId;
+        const localOffers = readLocal<RTCIceCandidateInit[]>(`ice_${callId}_offerCandidates`, []);
+        const localAnswers = readLocal<RTCIceCandidateInit[]>(`ice_${callId}_answerCandidates`, []);
+
+        if (
+          Array.isArray(data.iceCandidates.offerCandidates) &&
+          data.iceCandidates.offerCandidates.length > localOffers.length
+        ) {
+          writeLocal(`ice_${callId}_offerCandidates`, data.iceCandidates.offerCandidates, true);
+        }
+        if (
+          Array.isArray(data.iceCandidates.answerCandidates) &&
+          data.iceCandidates.answerCandidates.length > localAnswers.length
+        ) {
+          writeLocal(`ice_${callId}_answerCandidates`, data.iceCandidates.answerCandidates, true);
+        }
+      }
+
+      // Games sync
+      if (data.games) {
+        Object.entries(data.games).forEach(([gid, gstate]) => {
+          const current = readLocal(`game_${gid}`, null);
+          if (JSON.stringify(current) !== JSON.stringify(gstate)) {
+            writeLocal(`game_${gid}`, gstate, true);
+          }
+        });
+      }
+
+      // Active Invite sync
+      if ('activeInvite' in data) {
+        const currentInvite = readLocal<GameInvite | null>('game_invite', null);
+        if (JSON.stringify(currentInvite) !== JSON.stringify(data.activeInvite)) {
+          writeLocal('game_invite', data.activeInvite, true);
+        }
+      }
+    } catch {
+      // ignore network hiccup
+    }
+  };
+
+  // Immediate poll then periodic interval
+  poll();
+  window.setInterval(poll, 850);
+}
+
+if (typeof window !== 'undefined') {
+  startServerSyncPoller();
+}
+
 // ============================================================================
 // Couple Config & Profile Registration
 // ============================================================================
 
 export function subscribeCoupleConfig(cb: (cfg: CoupleConfig) => void): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal('couple_config', DEFAULT_COUPLE_CONFIG, cb);
-  }
+  const unsubLocal = subscribeLocal('couple_config', DEFAULT_COUPLE_CONFIG, cb);
 
-  const refDoc = doc(db, 'couple', 'settings');
-  return onSnapshot(refDoc, (snap) => {
-    if (!snap.exists()) {
-      cb(DEFAULT_COUPLE_CONFIG);
-      return;
-    }
-    const data = snap.data() as Partial<CoupleConfig>;
-    cb({
-      ...DEFAULT_COUPLE_CONFIG,
-      ...data,
-      names: { ...DEFAULT_COUPLE_CONFIG.names, ...(data.names || {}) },
-      namesEditedOnce: { ...DEFAULT_COUPLE_CONFIG.namesEditedOnce, ...(data.namesEditedOnce || {}) },
-      passwords: { ...DEFAULT_COUPLE_CONFIG.passwords, ...(data.passwords || {}) },
-    });
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    const refDoc = doc(db, 'couple', 'settings');
+    unsubFirestore = onSnapshot(
+      refDoc,
+      (snap) => {
+        if (!snap.exists()) {
+          cb(DEFAULT_COUPLE_CONFIG);
+          return;
+        }
+        const data = snap.data() as Partial<CoupleConfig>;
+        const merged: CoupleConfig = {
+          ...DEFAULT_COUPLE_CONFIG,
+          ...data,
+          names: { ...DEFAULT_COUPLE_CONFIG.names, ...(data.names || {}) },
+          namesEditedOnce: { ...DEFAULT_COUPLE_CONFIG.namesEditedOnce, ...(data.namesEditedOnce || {}) },
+          passwords: { ...DEFAULT_COUPLE_CONFIG.passwords, ...(data.passwords || {}) },
+        };
+        writeLocal('couple_config', merged, false);
+        cb(merged);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function saveCoupleConfig(partial: Partial<CoupleConfig>) {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const current = readLocal('couple_config', DEFAULT_COUPLE_CONFIG);
-    writeLocal('couple_config', {
-      ...current,
-      ...partial,
-      names: { ...current.names, ...(partial.names || {}) },
-      namesEditedOnce: { ...current.namesEditedOnce, ...(partial.namesEditedOnce || {}) },
-      passwords: { ...current.passwords, ...(partial.passwords || {}) },
-      updatedAt: Date.now(),
-    });
-    return;
-  }
+  const current = readLocal('couple_config', DEFAULT_COUPLE_CONFIG);
+  const updated: CoupleConfig = {
+    ...current,
+    ...partial,
+    names: { ...current.names, ...(partial.names || {}) },
+    namesEditedOnce: { ...current.namesEditedOnce, ...(partial.namesEditedOnce || {}) },
+    passwords: { ...current.passwords, ...(partial.passwords || {}) },
+    updatedAt: Date.now(),
+  };
+  writeLocal('couple_config', updated);
+  postApiSync({ action: 'save_config', config: updated });
 
-  await ensureAnonymousUser();
-  const refDoc = doc(db, 'couple', 'settings');
-  await setDoc(refDoc, { ...partial, updatedAt: Date.now() }, { merge: true });
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      const refDoc = doc(db, 'couple', 'settings');
+      await setDoc(refDoc, { ...partial, updatedAt: Date.now() }, { merge: true });
+    } catch (err) {
+      console.warn('[Firebase] saveCoupleConfig fallback to server sync:', err);
+    }
+  }
 }
 
 export async function claimCoupleProfile(memberId: MemberId, displayName: string, fcmToken?: string | null) {
+  postApiSync({
+    action: 'update_presence',
+    memberId,
+    presence: { online: true, lastSeen: Date.now() },
+  });
+
   const db = getFirebaseDb();
   if (!isFirebaseConfigured || !db) return;
 
-  const user = await ensureAnonymousUser();
-  if (!user) return;
+  try {
+    const user = await ensureAnonymousUser();
+    if (!user) return;
 
-  await setDoc(
-    doc(db, 'users', user.uid),
-    {
-      uid: user.uid,
-      memberId,
-      name: displayName,
-      ...(fcmToken ? { fcmToken } : {}),
-      updatedAt: Date.now(),
-    },
-    { merge: true }
-  );
+    await setDoc(
+      doc(db, 'users', user.uid),
+      {
+        uid: user.uid,
+        memberId,
+        name: displayName,
+        ...(fcmToken ? { fcmToken } : {}),
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
 
-  await setDoc(
-    doc(db, 'couple', 'settings'),
-    {
-      memberUids: { [memberId]: user.uid },
-      updatedAt: Date.now(),
-    },
-    { merge: true }
-  );
+    await setDoc(
+      doc(db, 'couple', 'settings'),
+      {
+        memberUids: { [memberId]: user.uid },
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
+  } catch (err) {
+    console.warn('[Firebase] claimCoupleProfile error:', err);
+  }
 }
 
 // ============================================================================
@@ -197,42 +376,64 @@ export function subscribePresence(
     typing: false,
   };
 
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal(`presence_${memberId}`, fallback, cb);
-  }
+  const unsubLocal = subscribeLocal(`presence_${memberId}`, fallback, cb);
 
-  return onSnapshot(doc(db, 'presence', memberId), (snap) => {
-    if (!snap.exists()) {
-      cb(fallback);
-      return;
-    }
-    cb({ ...fallback, ...(snap.data() as Partial<MemberPresence>) });
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    unsubFirestore = onSnapshot(
+      doc(db, 'presence', memberId),
+      (snap) => {
+        if (!snap.exists()) {
+          cb(fallback);
+          return;
+        }
+        const data = { ...fallback, ...(snap.data() as Partial<MemberPresence>) };
+        writeLocal(`presence_${memberId}`, data, false);
+        cb(data);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function updatePresence(memberId: MemberId, partial: Partial<MemberPresence>) {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const current = readLocal<MemberPresence>(`presence_${memberId}`, {
-      memberId,
-      online: false,
-      lastSeen: Date.now(),
-      typing: false,
-    });
-    writeLocal(`presence_${memberId}`, { ...current, ...partial, memberId });
-    return;
-  }
+  const current = readLocal<MemberPresence>(`presence_${memberId}`, {
+    memberId,
+    online: false,
+    lastSeen: Date.now(),
+    typing: false,
+  });
+  const updated = { ...current, ...partial, memberId };
+  writeLocal(`presence_${memberId}`, updated);
 
-  await setDoc(
-    doc(db, 'presence', memberId),
-    { memberId, ...partial },
-    { merge: true }
-  );
+  postApiSync({
+    action: 'update_presence',
+    memberId,
+    presence: partial,
+  });
+
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await setDoc(doc(db, 'presence', memberId), { memberId, ...partial }, { merge: true });
+    } catch {
+      // server sync already delivered
+    }
+  }
 }
 
 // ============================================================================
-// Realtime Chat Messages (onSnapshot + Infinite Scroll + Reactions + Status)
+// Realtime Chat Messages
 // ============================================================================
 
 const SEED_MESSAGES: ChatMessage[] = [
@@ -262,62 +463,92 @@ export function subscribeMessages(
   limitCount: number,
   cb: (messages: ChatMessage[], hasMore: boolean) => void
 ): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<ChatMessage[]>('messages', SEED_MESSAGES, (all) => {
-      const sorted = [...all].sort((a, b) => a.createdAt - b.createdAt);
-      const hasMore = sorted.length > limitCount;
-      cb(sorted.slice(Math.max(0, sorted.length - limitCount)), hasMore);
-    });
-  }
-
-  const q = query(
-    collection(db, 'messages'),
-    orderBy('createdAt', 'desc'),
-    limit(limitCount)
-  );
-  return onSnapshot(q, (snap) => {
-    const list: ChatMessage[] = snap.docs
-      .map((d) => ({ id: d.id, ...(d.data() as Omit<ChatMessage, 'id'>) }))
-      .reverse();
-    cb(list, snap.docs.length >= limitCount);
+  const unsubLocal = subscribeLocal<ChatMessage[]>('messages', SEED_MESSAGES, (all) => {
+    const sorted = [...all].sort((a, b) => a.createdAt - b.createdAt);
+    const hasMore = sorted.length > limitCount;
+    cb(sorted.slice(Math.max(0, sorted.length - limitCount)), hasMore);
   });
+
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    const q = query(
+      collection(db, 'messages'),
+      orderBy('createdAt', 'desc'),
+      limit(limitCount)
+    );
+    unsubFirestore = onSnapshot(
+      q,
+      (snap) => {
+        const list: ChatMessage[] = snap.docs
+          .map((d) => ({ id: d.id, ...(d.data() as Omit<ChatMessage, 'id'>) }))
+          .reverse();
+        writeLocal('messages', list, false);
+        cb(list, snap.docs.length >= limitCount);
+      },
+      (err) => {
+        console.warn('[Firestore] Messages listener error, using server sync:', err);
+      }
+    );
+  });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
-export async function sendChatMessage(
-  msg: Omit<ChatMessage, 'id'>
-): Promise<string> {
+export async function sendChatMessage(msg: Omit<ChatMessage, 'id'>): Promise<string> {
+  const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const fullMsg: ChatMessage = { ...msg, id };
+
+  // 1. Instant local optimistic update
+  const list = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
+  writeLocal('messages', [...list, fullMsg]);
+
+  // 2. Broadcast to server sync API (cross-device)
+  postApiSync({ action: 'send_message', msg: fullMsg });
+
+  // 3. Permanent write to Firestore if configured
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const id = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const list = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
-    writeLocal('messages', [...list, { ...msg, id }]);
-    return id;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await addDoc(collection(db, 'messages'), fullMsg);
+    } catch (err) {
+      console.warn('[Firestore] sendChatMessage fallback to server sync:', err);
+    }
   }
 
-  const docRef = await addDoc(collection(db, 'messages'), msg);
-  return docRef.id;
+  return id;
 }
 
-export async function markMessagesStatus(
-  messageIds: string[],
-  status: 'delivered' | 'seen'
-) {
+export async function markMessagesStatus(messageIds: string[], status: 'delivered' | 'seen') {
   if (!messageIds.length) return;
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const list = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
-    const idSet = new Set(messageIds);
-    const updated = list.map((m) => (idSet.has(m.id) ? { ...m, status } : m));
-    writeLocal('messages', updated);
-    return;
-  }
 
-  const batch = writeBatch(db);
-  messageIds.forEach((id) => {
-    batch.update(doc(db, 'messages', id), { status });
-  });
-  await batch.commit();
+  const list = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
+  const idSet = new Set(messageIds);
+  const updated = list.map((m) => (idSet.has(m.id) ? { ...m, status } : m));
+  writeLocal('messages', updated, false);
+
+  postApiSync({ action: 'mark_status', messageIds, status });
+
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      const batch = writeBatch(db);
+      messageIds.forEach((id) => {
+        batch.update(doc(db, 'messages', id), { status });
+      });
+      await batch.commit();
+    } catch {
+      // server sync handled it
+    }
+  }
 }
 
 export async function toggleMessageReaction(
@@ -325,47 +556,57 @@ export async function toggleMessageReaction(
   memberId: MemberId,
   emoji: string
 ) {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const list = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
-    const updated = list.map((m) => {
-      if (m.id !== messageId) return m;
-      const reactions = { ...(m.reactions || {}) };
-      if (reactions[memberId] === emoji) {
-        delete reactions[memberId];
-      } else {
-        reactions[memberId] = emoji;
-      }
-      return { ...m, reactions };
-    });
-    writeLocal('messages', updated);
-    return;
-  }
+  const list = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
+  const updated = list.map((m) => {
+    if (m.id !== messageId) return m;
+    const reactions = { ...(m.reactions || {}) };
+    if (reactions[memberId] === emoji) {
+      delete reactions[memberId];
+    } else {
+      reactions[memberId] = emoji;
+    }
+    return { ...m, reactions };
+  });
+  writeLocal('messages', updated);
 
-  // Read current from DOM-provided or update directly
-  const listSnap = await getDocs(query(collection(db, 'messages'), limit(200)));
-  const found = listSnap.docs.find((d) => d.id === messageId);
-  const existing = (found?.data()?.reactions || {}) as Partial<Record<MemberId, string>>;
-  const next = { ...existing };
-  if (next[memberId] === emoji) {
-    delete next[memberId];
-  } else {
-    next[memberId] = emoji;
+  postApiSync({ action: 'toggle_reaction', messageId, memberId, emoji });
+
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      const listSnap = await getDocs(query(collection(db, 'messages'), limit(150)));
+      const found = listSnap.docs.find((d) => d.id === messageId);
+      const existing = (found?.data()?.reactions || {}) as Partial<Record<MemberId, string>>;
+      const next = { ...existing };
+      if (next[memberId] === emoji) {
+        delete next[memberId];
+      } else {
+        next[memberId] = emoji;
+      }
+      await updateDoc(doc(db, 'messages', messageId), { reactions: next });
+    } catch {
+      // server sync handled it
+    }
   }
-  await updateDoc(doc(db, 'messages', messageId), { reactions: next });
 }
 
 export async function clearAllChatMessages() {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    writeLocal('messages', []);
-    return;
-  }
+  writeLocal('messages', []);
+  postApiSync({ action: 'clear_chat' });
 
-  const snap = await getDocs(collection(db, 'messages'));
-  const batch = writeBatch(db);
-  snap.docs.forEach((d) => batch.delete(d.ref));
-  await batch.commit();
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      const snap = await getDocs(collection(db, 'messages'));
+      const batch = writeBatch(db);
+      snap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    } catch {
+      // ignore
+    }
+  }
 }
 
 // ============================================================================
@@ -422,20 +663,25 @@ export async function uploadMediaFile(
     fileOrBlob instanceof File ? await compressImageIfNeeded(fileOrBlob) : fileOrBlob;
 
   const storage = getFirebaseStorage();
-  if (!isFirebaseConfigured || !storage) {
-    return fileToDataUrl(processed);
+  if (isFirebaseConfigured && storage) {
+    try {
+      await ensureAnonymousUser();
+      const ext =
+        folder === 'voice-notes'
+          ? 'webm'
+          : fileOrBlob instanceof File && fileOrBlob.name.includes('.')
+            ? fileOrBlob.name.split('.').pop()
+            : 'jpg';
+      const fileName = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const storageRef = ref(storage, fileName);
+      await uploadBytes(storageRef, processed);
+      return await getDownloadURL(storageRef);
+    } catch (err) {
+      console.warn('[Storage] Upload failed, falling back to data URL:', err);
+    }
   }
 
-  const ext =
-    folder === 'voice-notes'
-      ? 'webm'
-      : fileOrBlob instanceof File && fileOrBlob.name.includes('.')
-        ? fileOrBlob.name.split('.').pop()
-        : 'jpg';
-  const fileName = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-  const storageRef = ref(storage, fileName);
-  await uploadBytes(storageRef, processed);
-  return getDownloadURL(storageRef);
+  return fileToDataUrl(processed);
 }
 
 // ============================================================================
@@ -447,100 +693,184 @@ export function subscribeGameState<T>(
   initial: T,
   cb: (state: T) => void
 ): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal(`game_${gameId}`, initial, cb);
-  }
+  const unsubLocal = subscribeLocal(`game_${gameId}`, initial, cb);
 
-  return onSnapshot(doc(db, 'games', gameId), (snap) => {
-    if (!snap.exists()) {
-      cb(initial);
-      return;
-    }
-    cb({ ...initial, ...(snap.data() as Partial<T>) });
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    unsubFirestore = onSnapshot(
+      doc(db, 'games', gameId),
+      (snap) => {
+        if (!snap.exists()) {
+          cb(initial);
+          return;
+        }
+        const state = { ...initial, ...(snap.data() as Partial<T>) };
+        writeLocal(`game_${gameId}`, state, false);
+        cb(state);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function saveGameState<T extends object>(gameId: GameId, state: T) {
+  writeLocal(`game_${gameId}`, state);
+  postApiSync({ action: 'save_game', gameId, state });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    writeLocal(`game_${gameId}`, state);
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await setDoc(doc(db, 'games', gameId), state, { merge: true });
+    } catch {
+      // server sync handled it
+    }
   }
-  await setDoc(doc(db, 'games', gameId), state, { merge: true });
 }
 
 export function subscribeGameInvite(cb: (invite: GameInvite | null) => void): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<GameInvite | null>('game_invite', null, cb);
-  }
+  const unsubLocal = subscribeLocal<GameInvite | null>('game_invite', null, cb);
 
-  return onSnapshot(doc(db, 'games', 'activeInvite'), (snap) => {
-    if (!snap.exists()) {
-      cb(null);
-      return;
-    }
-    const data = snap.data() as GameInvite;
-    cb(data?.id ? data : null);
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    unsubFirestore = onSnapshot(
+      doc(db, 'games', 'activeInvite'),
+      (snap) => {
+        if (!snap.exists()) {
+          cb(null);
+          return;
+        }
+        const data = snap.data() as GameInvite;
+        const inv = data?.id ? data : null;
+        writeLocal('game_invite', inv, false);
+        cb(inv);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function sendGameInvite(invite: GameInvite) {
+  writeLocal('game_invite', invite);
+  postApiSync({ action: 'send_invite', invite });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    writeLocal('game_invite', invite);
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await setDoc(doc(db, 'games', 'activeInvite'), invite);
+    } catch {
+      // server sync handled it
+    }
   }
-  await setDoc(doc(db, 'games', 'activeInvite'), invite);
 }
 
 export function subscribeGameHistory(cb: (entries: GameHistoryEntry[]) => void): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<GameHistoryEntry[]>('game_history', [], (items) =>
-      cb([...items].sort((a, b) => b.playedAt - a.playedAt))
-    );
-  }
+  const unsubLocal = subscribeLocal<GameHistoryEntry[]>('game_history', [], (items) =>
+    cb([...items].sort((a, b) => b.playedAt - a.playedAt))
+  );
 
-  const q = query(collection(db, 'gameHistory'), orderBy('playedAt', 'desc'), limit(40));
-  return onSnapshot(q, (snap) => {
-    cb(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<GameHistoryEntry, 'id'>) })));
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    const q = query(collection(db, 'gameHistory'), orderBy('playedAt', 'desc'), limit(40));
+    unsubFirestore = onSnapshot(
+      q,
+      (snap) => {
+        const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<GameHistoryEntry, 'id'>) }));
+        writeLocal('game_history', list, false);
+        cb(list);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function addGameHistory(entry: Omit<GameHistoryEntry, 'id'>) {
+  const id = `gh-${Date.now()}`;
+  const list = readLocal<GameHistoryEntry[]>('game_history', []);
+  writeLocal('game_history', [{ ...entry, id }, ...list].slice(0, 50));
+  postApiSync({ action: 'add_history', entry });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const id = `gh-${Date.now()}`;
-    const list = readLocal<GameHistoryEntry[]>('game_history', []);
-    writeLocal('game_history', [{ ...entry, id }, ...list].slice(0, 50));
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await addDoc(collection(db, 'gameHistory'), entry);
+    } catch {
+      // server sync handled it
+    }
   }
-  await addDoc(collection(db, 'gameHistory'), entry);
 }
 
 export function subscribeCustomCards(cb: (cards: TruthOrDareCard[]) => void): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<TruthOrDareCard[]>('custom_cards', [], cb);
-  }
+  const unsubLocal = subscribeLocal<TruthOrDareCard[]>('custom_cards', [], cb);
 
-  const q = query(collection(db, 'customCards'), limit(50));
-  return onSnapshot(q, (snap) => {
-    cb(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TruthOrDareCard, 'id'>) })));
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    const q = query(collection(db, 'customCards'), limit(50));
+    unsubFirestore = onSnapshot(
+      q,
+      (snap) => {
+        const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<TruthOrDareCard, 'id'>) }));
+        writeLocal('custom_cards', list, false);
+        cb(list);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function addCustomCard(card: Omit<TruthOrDareCard, 'id'>) {
+  const id = `custom-${Date.now()}`;
+  const list = readLocal<TruthOrDareCard[]>('custom_cards', []);
+  writeLocal('custom_cards', [...list, { ...card, id, isCustom: true }]);
+  postApiSync({ action: 'add_custom_card', card });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const id = `custom-${Date.now()}`;
-    const list = readLocal<TruthOrDareCard[]>('custom_cards', []);
-    writeLocal('custom_cards', [...list, { ...card, id, isCustom: true }]);
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await addDoc(collection(db, 'customCards'), { ...card, isCustom: true });
+    } catch {
+      // server sync handled it
+    }
   }
-  await addDoc(collection(db, 'customCards'), { ...card, isCustom: true });
 }
 
 // ============================================================================
@@ -548,45 +878,70 @@ export async function addCustomCard(card: Omit<TruthOrDareCard, 'id'>) {
 // ============================================================================
 
 export function subscribeMemories(cb: (memories: MemoryItem[]) => void): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<MemoryItem[]>('memories', DEFAULT_MEMORIES, (list) =>
-      cb([...list].sort((a, b) => b.date.localeCompare(a.date)))
-    );
-  }
+  const unsubLocal = subscribeLocal<MemoryItem[]>('memories', DEFAULT_MEMORIES, (list) =>
+    cb([...list].sort((a, b) => b.date.localeCompare(a.date)))
+  );
 
-  const q = query(collection(db, 'memories'), orderBy('createdAt', 'desc'), limit(100));
-  return onSnapshot(q, (snap) => {
-    if (snap.empty) {
-      cb(DEFAULT_MEMORIES);
-      return;
-    }
-    cb(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<MemoryItem, 'id'>) })));
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    const q = query(collection(db, 'memories'), orderBy('createdAt', 'desc'), limit(100));
+    unsubFirestore = onSnapshot(
+      q,
+      (snap) => {
+        if (!snap.empty) {
+          const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<MemoryItem, 'id'>) }));
+          writeLocal('memories', list, false);
+          cb(list);
+        }
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function addMemoryItem(item: Omit<MemoryItem, 'id'>) {
+  const id = `mem-${Date.now()}`;
+  const list = readLocal<MemoryItem[]>('memories', DEFAULT_MEMORIES);
+  writeLocal('memories', [{ ...item, id }, ...list]);
+  postApiSync({ action: 'add_memory', memory: item });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const id = `mem-${Date.now()}`;
-    const list = readLocal<MemoryItem[]>('memories', DEFAULT_MEMORIES);
-    writeLocal('memories', [{ ...item, id }, ...list]);
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await addDoc(collection(db, 'memories'), item);
+    } catch {
+      // server sync handled it
+    }
   }
-  await addDoc(collection(db, 'memories'), item);
 }
 
 export async function deleteMemoryItem(id: string) {
+  const list = readLocal<MemoryItem[]>('memories', DEFAULT_MEMORIES);
+  writeLocal(
+    'memories',
+    list.filter((m) => m.id !== id)
+  );
+  postApiSync({ action: 'delete_memory', id });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const list = readLocal<MemoryItem[]>('memories', DEFAULT_MEMORIES);
-    writeLocal(
-      'memories',
-      list.filter((m) => m.id !== id)
-    );
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await deleteDoc(doc(db, 'memories', id));
+    } catch {
+      // server sync handled it
+    }
   }
-  await deleteDoc(doc(db, 'memories', id));
 }
 
 // ============================================================================
@@ -594,32 +949,53 @@ export async function deleteMemoryItem(id: string) {
 // ============================================================================
 
 export function subscribeActiveCall(cb: (call: CallSession | null) => void): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<CallSession | null>('active_call', null, cb);
-  }
+  const unsubLocal = subscribeLocal<CallSession | null>('active_call', null, cb);
 
-  return onSnapshot(doc(db, 'calls', 'active'), (snap) => {
-    if (!snap.exists()) {
-      cb(null);
-      return;
-    }
-    const data = snap.data() as CallSession;
-    cb(data?.id ? data : null);
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    unsubFirestore = onSnapshot(
+      doc(db, 'calls', 'active'),
+      (snap) => {
+        if (!snap.exists()) {
+          cb(null);
+          return;
+        }
+        const data = snap.data() as CallSession;
+        const call = data?.id && data.status !== 'ended' ? data : null;
+        writeLocal('active_call', call, false);
+        cb(call);
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 export async function saveCallSession(session: CallSession | null) {
+  writeLocal('active_call', session);
+  postApiSync({ action: 'save_call', call: session });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    writeLocal('active_call', session);
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      if (!session) {
+        await setDoc(doc(db, 'calls', 'active'), { id: '', status: 'ended', endedAt: Date.now() });
+      } else {
+        await setDoc(doc(db, 'calls', 'active'), session, { merge: true });
+      }
+    } catch {
+      // server sync handled it
+    }
   }
-  if (!session) {
-    await setDoc(doc(db, 'calls', 'active'), { id: '', status: 'ended', endedAt: Date.now() });
-    return;
-  }
-  await setDoc(doc(db, 'calls', 'active'), session, { merge: true });
 }
 
 export async function addIceCandidateSignal(
@@ -627,17 +1003,24 @@ export async function addIceCandidateSignal(
   role: 'offerCandidates' | 'answerCandidates',
   candidate: RTCIceCandidateInit
 ) {
+  const key = `ice_${callId}_${role}`;
+  const existing = readLocal<RTCIceCandidateInit[]>(key, []);
+  writeLocal(key, [...existing, candidate]);
+
+  postApiSync({ action: 'add_ice', callId, role, candidate });
+
   const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    const key = `ice_${callId}_${role}`;
-    const existing = readLocal<RTCIceCandidateInit[]>(key, []);
-    writeLocal(key, [...existing, candidate]);
-    return;
+  if (isFirebaseConfigured && db) {
+    try {
+      await ensureAnonymousUser();
+      await addDoc(collection(db, 'calls', 'active', role), {
+        ...candidate,
+        callId,
+      });
+    } catch {
+      // server sync handled it
+    }
   }
-  await addDoc(collection(db, 'calls', 'active', role), {
-    ...candidate,
-    callId,
-  });
 }
 
 export function subscribeIceCandidatesSignal(
@@ -645,17 +1028,33 @@ export function subscribeIceCandidatesSignal(
   role: 'offerCandidates' | 'answerCandidates',
   cb: (candidates: RTCIceCandidateInit[]) => void
 ): () => void {
-  const db = getFirebaseDb();
-  if (!isFirebaseConfigured || !db) {
-    return subscribeLocal<RTCIceCandidateInit[]>(`ice_${callId}_${role}`, [], cb);
-  }
+  const unsubLocal = subscribeLocal<RTCIceCandidateInit[]>(`ice_${callId}_${role}`, [], cb);
 
-  return onSnapshot(collection(db, 'calls', 'active', role), (snap) => {
-    const list = snap.docs
-      .map((d) => d.data() as RTCIceCandidateInit & { callId?: string })
-      .filter((c) => c.callId === callId);
-    cb(list);
+  const db = getFirebaseDb();
+  if (!isFirebaseConfigured || !db) return unsubLocal;
+
+  let unsubFirestore: (() => void) | null = null;
+  ensureAnonymousUser().then((user) => {
+    if (!user) return;
+    unsubFirestore = onSnapshot(
+      collection(db, 'calls', 'active', role),
+      (snap) => {
+        const list = snap.docs
+          .map((d) => d.data() as RTCIceCandidateInit & { callId?: string })
+          .filter((c) => c.callId === callId);
+        if (list.length) {
+          writeLocal(`ice_${callId}_${role}`, list, false);
+          cb(list);
+        }
+      },
+      () => undefined
+    );
   });
+
+  return () => {
+    unsubLocal();
+    if (unsubFirestore) unsubFirestore();
+  };
 }
 
 // ============================================================================

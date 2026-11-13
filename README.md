@@ -49,7 +49,7 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-> **Instant Multi-Tab Preview Mode:** Even before adding Firebase keys, the app works out-of-the-box using `BroadcastChannel` + `localStorage` so you can open two tabs side by side (Avinash in Tab 1 with `Avi123`, Athulya in Tab 2 with `Sree123`) and test realtime chat, games, video call signaling, and "Miss you" hearts immediately!
+> **Instant Cross-Device & Multi-Tab Sync:** The app features a dual sync engine. It works immediately across two phones on the same Wi-Fi, over the internet, and between browser tabs using the built-in `/api/sync` real-time channel + `BroadcastChannel`. When Firebase keys are added to `.env.local`, Firestore provides permanent cloud database backup and storage!
 
 ---
 

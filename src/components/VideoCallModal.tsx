@@ -18,6 +18,9 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
   ],
 };
 
@@ -53,6 +56,7 @@ export function VideoCallModal() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const addedIceRef = useRef<Set<string>>(new Set());
+  const queuedRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const startedOutgoingRef = useRef<string | null>(null);
   const answeredRef = useRef<string | null>(null);
 
@@ -68,21 +72,53 @@ export function VideoCallModal() {
     }
     remoteStreamRef.current = null;
     addedIceRef.current.clear();
+    queuedRemoteCandidatesRef.current = [];
     startedOutgoingRef.current = null;
     answeredRef.current = null;
+  }, []);
+
+  const flushQueuedIce = useCallback((pc: RTCPeerConnection) => {
+    while (queuedRemoteCandidatesRef.current.length > 0) {
+      const cand = queuedRemoteCandidatesRef.current.shift()!;
+      const key = JSON.stringify(cand);
+      if (!addedIceRef.current.has(key)) {
+        addedIceRef.current.add(key);
+        pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
+      }
+    }
   }, []);
 
   const setupPeerConnection = useCallback(
     async (mode: 'video' | 'audio', callId: string, role: 'offer' | 'answer') => {
       if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-        setMediaError('Camera/microphone unavailable in this browser context.');
+        setMediaError('Camera/microphone unavailable. HTTPS or localhost required.');
         return null;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: mode === 'video',
-      });
+      let stream: MediaStream | null = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: mode === 'video',
+        });
+      } catch (err) {
+        console.warn('[WebRTC] Media error:', err);
+        if (mode === 'video') {
+          // Camera might be in use by another tab or process; try audio-only fallback
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            setCamOff(true);
+            setMediaError('Camera unavailable or in use; connected in voice mode.');
+          } catch {
+            setMediaError('Unable to access microphone. Please check permissions.');
+            return null;
+          }
+        } else {
+          setMediaError('Unable to access microphone. Please check permissions.');
+          return null;
+        }
+      }
+
       localStreamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -98,7 +134,7 @@ export function VideoCallModal() {
       }
 
       stream.getTracks().forEach((track) => {
-        pc.addTrack(track, stream);
+        pc.addTrack(track, stream!);
       });
 
       pc.ontrack = (event) => {
@@ -195,7 +231,9 @@ export function VideoCallModal() {
       activeCall.answer &&
       !pc.currentRemoteDescription
     ) {
-      pc.setRemoteDescription(new RTCSessionDescription(activeCall.answer)).catch(() => undefined);
+      pc.setRemoteDescription(new RTCSessionDescription(activeCall.answer))
+        .then(() => flushQueuedIce(pc))
+        .catch(() => undefined);
     }
 
     const remoteRole =
@@ -203,13 +241,16 @@ export function VideoCallModal() {
     return subscribeIceCandidatesSignal(activeCall.id, remoteRole, (candidates) => {
       candidates.forEach((cand) => {
         const key = JSON.stringify(cand);
-        if (!addedIceRef.current.has(key) && pc.remoteDescription) {
+        if (addedIceRef.current.has(key)) return;
+        if (pc.remoteDescription && pc.remoteDescription.type) {
           addedIceRef.current.add(key);
           pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
+        } else {
+          queuedRemoteCandidatesRef.current.push(cand);
         }
       });
     });
-  }, [activeCall, activeMember]);
+  }, [activeCall, activeMember, flushQueuedIce]);
 
   // Call timer when connected
   useEffect(() => {
@@ -244,6 +285,7 @@ export function VideoCallModal() {
       const pc = await setupPeerConnection(activeCall.mode, activeCall.id, 'answer');
       if (!pc || !activeCall.offer) return;
       await pc.setRemoteDescription(new RTCSessionDescription(activeCall.offer));
+      flushQueuedIce(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       await saveCallSession({
@@ -451,4 +493,3 @@ export function VideoCallModal() {
     </AnimatePresence>
   );
 }
-

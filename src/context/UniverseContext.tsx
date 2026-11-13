@@ -38,7 +38,8 @@ import {
   MemberPresence,
 } from '@/types/universe';
 
-const SESSION_KEY = 'olu_active_profile';
+const SESSION_KEY = 'olu_active_profile_session';
+const PERSIST_KEY = 'olu_active_profile';
 const PREFS_KEY = 'olu_local_prefs';
 const UNREAD_DIVIDER_KEY = 'olu_last_read_ts';
 
@@ -145,7 +146,10 @@ export function UniverseProvider({ children }: { children: React.ReactNode }) {
     if (typeof window === 'undefined') return;
 
     const timer = window.setTimeout(() => {
-      const savedMember = window.localStorage.getItem(SESSION_KEY) as MemberId | null;
+      const savedMember = (
+        window.sessionStorage.getItem(SESSION_KEY) ||
+        window.localStorage.getItem(PERSIST_KEY)
+      ) as MemberId | null;
       if (savedMember === 'avinash' || savedMember === 'athulya') {
         setActiveMember(savedMember);
       }
@@ -436,7 +440,8 @@ export function UniverseProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (typeof window !== 'undefined') {
-        window.localStorage.setItem(SESSION_KEY, member);
+        window.sessionStorage.setItem(SESSION_KEY, member);
+        window.localStorage.setItem(PERSIST_KEY, member);
       }
       setActiveMember(member);
       await claimCoupleProfile(member, config.names[member], fcmToken).catch(() => undefined);
@@ -455,7 +460,8 @@ export function UniverseProvider({ children }: { children: React.ReactNode }) {
       );
     }
     if (typeof window !== 'undefined') {
-      window.localStorage.removeItem(SESSION_KEY);
+      window.sessionStorage.removeItem(SESSION_KEY);
+      window.localStorage.removeItem(PERSIST_KEY);
     }
     setActiveMember(null);
     setSelectedGame(null);

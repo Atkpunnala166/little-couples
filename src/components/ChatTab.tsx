@@ -46,6 +46,31 @@ function formatLastSeen(ts: number) {
   return new Date(ts).toLocaleDateString();
 }
 
+const EMOJI_KEYWORD_MAP: Record<string, string[]> = {
+  love: ['❤️', '🩷', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💌', '💍', '💐', '🌹', '🥀', '🌺', '🌸', '🌷', '💋', '🫂', '🫶', '👩‍❤️‍👨', '👩‍❤️‍💋‍👨', '💑', '💏'],
+  heart: ['❤️', '🩷', '🧡', '💛', '💚', '💙', '🩵', '💜', '🤎', '🖤', '🩶', '🤍', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '🫶'],
+  kiss: ['😘', '😗', '😙', '😚', '💋', '👩‍❤️‍💋‍👨', '💏'],
+  smile: ['😀', '😃', '😄', '😁', '😆', '🥹', '😅', '😂', '🤣', '☺️', '😊', '😇', '🙂', '😉', '😌', '😍', '🥰'],
+  cry: ['😢', '😭', '🥹', '🥺', '😿'],
+  laugh: ['😂', '🤣', '😆', '😄', '😀'],
+  cat: ['🐱', '🐈', '🐈‍⬛'],
+  dog: ['🐶', '🐕', '🦮', '🐩'],
+  bear: ['🐻', '🐻‍❄️', '🧸'],
+  fire: ['🔥', '💥', '⚡'],
+  star: ['⭐', '🌟', '✨', '💫'],
+  food: ['🍓', '🍒', '🍕', '🍔', '🍟', '🍫', '🎂', '🍰', '🧁', '🍦', '🍩', '🥐', '🥞', '🍣'],
+  drink: ['☕', '🧋', '🍵', '🧃', '🥤', '🍺', '🍻', '🥂', '🍷', '🥃', '🍸', '🍹', '🍾'],
+  party: ['🎉', '🎊', '🎈', '🎂', '🎁', '🎀', '🪄', '🪩', '🎆', '🎇', '✨', '👑'],
+  sad: ['😢', '😭', '🥺', '😞', '😔', '😟', '😕', '🙁', '☹️'],
+  cool: ['😎', '😏', '🤙', '🔥'],
+  sleep: ['😴', '🤤', '😪', '💤', '🥱', '🌙'],
+  hug: ['🫂', '🤗'],
+  rose: ['🌹', '🥀', '💐', '🌺', '🌸', '🌷'],
+  flower: ['🌹', '🥀', '💐', '🌺', '🌸', '🌷', '🌻', '🪷', '🪻'],
+  car: ['🚗', '🚘', '🚙', '🏎️'],
+  music: ['🎵', '🎶', '🎤', '🎧', '🎸', '🎹', '🎷', '🎺'],
+};
+
 export function ChatTab() {
   const {
     activeMember,
@@ -68,6 +93,8 @@ export function ChatTab() {
   const [text, setText] = useState('');
   const [replyTo, setReplyTo] = useState<ReplyReference | null>(null);
   const [showEmoji, setShowEmoji] = useState(false);
+  const [selectedEmojiGroup, setSelectedEmojiGroup] = useState<string>('all');
+  const [emojiSearch, setEmojiSearch] = useState<string>('');
   const [showGif, setShowGif] = useState(false);
   const [customGifUrl, setCustomGifUrl] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
@@ -86,6 +113,28 @@ export function ChatTab() {
     }, 0);
     return () => window.clearTimeout(t);
   }, []);
+
+  const displayedEmojiGroups = useMemo(() => {
+    const q = emojiSearch.trim().toLowerCase();
+    return EMOJI_GROUPS.map((grp) => {
+      if (selectedEmojiGroup !== 'all' && grp.id !== selectedEmojiGroup) {
+        return null;
+      }
+      if (!q) return grp;
+
+      const keywordMatches = Object.entries(EMOJI_KEYWORD_MAP)
+        .filter(([kw]) => kw.includes(q) || q.includes(kw))
+        .flatMap(([, ems]) => ems);
+
+      const labelMatch = grp.label.toLowerCase().includes(q);
+      const filtered = labelMatch
+        ? grp.emojis
+        : grp.emojis.filter((em) => em.includes(q) || keywordMatches.includes(em));
+
+      if (!filtered.length) return null;
+      return { ...grp, emojis: filtered };
+    }).filter(Boolean) as typeof EMOJI_GROUPS;
+  }, [selectedEmojiGroup, emojiSearch]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -666,34 +715,108 @@ export function ChatTab() {
           )}
         </AnimatePresence>
 
-        {/* Emoji Picker Drawer */}
+        {/* Full Categorized Emoji Suite with Category Tabs & Search */}
         <AnimatePresence>
           {showEmoji && (
             <motion.div
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 12 }}
-              className="glass-card rounded-3xl p-3.5 space-y-2.5 max-h-56 overflow-y-auto"
+              initial={{ opacity: 0, y: 12, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 12, scale: 0.98 }}
+              className="glass-card rounded-3xl p-3.5 space-y-3 max-h-72 flex flex-col shadow-2xl border border-pink-500/20"
             >
-              {EMOJI_GROUPS.map((grp) => (
-                <div key={grp.label}>
-                  <p className="text-[10px] uppercase tracking-wider text-pink-200/55 mb-1">
-                    {grp.label}
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {grp.emojis.map((em) => (
-                      <button
-                        key={em}
-                        type="button"
-                        onClick={() => handleTypingChange(text + em)}
-                        className="text-xl hover:scale-125 transition-transform p-1"
-                      >
-                        {em}
-                      </button>
-                    ))}
-                  </div>
+              {/* Header: Search Bar & Dismiss */}
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-pink-300/50" />
+                  <input
+                    type="text"
+                    value={emojiSearch}
+                    onChange={(e) => setEmojiSearch(e.target.value)}
+                    placeholder="Search all emojis (e.g. love, kiss, smile)..."
+                    className="w-full rounded-xl bg-black/40 border border-white/10 pl-8 pr-7 py-1.5 text-xs text-white placeholder:text-pink-200/35 focus:outline-none focus:border-pink-400"
+                  />
+                  {emojiSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setEmojiSearch('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-pink-200/50 hover:text-white"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
                 </div>
-              ))}
+                <button
+                  type="button"
+                  onClick={() => setShowEmoji(false)}
+                  className="p-1 rounded-lg text-pink-200/60 hover:text-white hover:bg-white/10 transition"
+                  aria-label="Close emoji picker"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              {/* Category Tabs Strip */}
+              <div className="flex items-center gap-1 overflow-x-auto pb-1 scrollbar-none border-b border-white/10">
+                <button
+                  type="button"
+                  onClick={() => setSelectedEmojiGroup('all')}
+                  className={`px-2 py-1 rounded-xl text-xs font-medium whitespace-nowrap transition ${
+                    selectedEmojiGroup === 'all'
+                      ? 'bg-pink-500/30 text-white border border-pink-400/40'
+                      : 'text-pink-200/60 hover:text-white hover:bg-white/5'
+                  }`}
+                >
+                  ✨ All
+                </button>
+                {EMOJI_GROUPS.map((grp) => (
+                  <button
+                    key={grp.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedEmojiGroup(grp.id);
+                      setEmojiSearch('');
+                    }}
+                    title={grp.label}
+                    className={`px-2 py-1 rounded-xl text-sm whitespace-nowrap transition flex items-center gap-1 ${
+                      selectedEmojiGroup === grp.id
+                        ? 'bg-pink-500/30 border border-pink-400/40 scale-105'
+                        : 'opacity-70 hover:opacity-100 hover:bg-white/5'
+                    }`}
+                  >
+                    <span>{grp.icon}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Scrollable Emojis Grid */}
+              <div className="overflow-y-auto pr-1 space-y-3 flex-1 scrollbar-thin">
+                {displayedEmojiGroups.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-pink-200/40">
+                    No emojis found for &quot;{emojiSearch}&quot;
+                  </div>
+                ) : (
+                  displayedEmojiGroups.map((grp) => (
+                    <div key={grp.id || grp.label}>
+                      <p className="text-[10px] font-semibold tracking-wider text-pink-300/60 uppercase mb-1.5 flex items-center gap-1.5">
+                        <span>{grp.icon}</span>
+                        <span>{grp.label}</span>
+                      </p>
+                      <div className="grid grid-cols-8 sm:grid-cols-10 gap-1">
+                        {grp.emojis.map((em) => (
+                          <button
+                            key={em}
+                            type="button"
+                            onClick={() => handleTypingChange(text + em)}
+                            className="h-9 w-9 flex items-center justify-center text-xl rounded-xl hover:bg-white/15 hover:scale-125 active:scale-95 transition"
+                          >
+                            {em}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
             </motion.div>
           )}
         </AnimatePresence>

@@ -127,13 +127,36 @@ function subscribeLocal<T>(key: string, fallback: T, cb: (val: T) => void): () =
 // End-to-End Decryption Helpers
 // ----------------------------------------------------------------------------
 
+export const SEED_MESSAGES: ChatMessage[] = [
+  {
+    id: 'welcome-1',
+    senderId: 'avinash',
+    senderName: 'Avinash',
+    text: 'Welcome to Our Little Universe 💗 Just the two of us, forever.',
+    mediaType: 'text',
+    createdAt: 1739491200000,
+    status: 'seen',
+    reactions: { athulya: '🌹' },
+  },
+  {
+    id: 'welcome-2',
+    senderId: 'athulya',
+    senderName: 'Athulya',
+    text: 'My favorite little corner of the world 🌹✨ Missed you today!',
+    mediaType: 'text',
+    createdAt: 1739577600000,
+    status: 'seen',
+    reactions: { avinash: '💗' },
+  },
+];
+
 async function decryptMessageIfNeeded(msg: ChatMessage): Promise<ChatMessage> {
   let text = msg.text;
-  if (text && text.startsWith('enc:v1:')) {
+  if (text && (text.startsWith('enc:v1:') || text.startsWith('enc:js1:'))) {
     text = await decryptTextE2EE(text);
   }
   let replyTo = msg.replyTo;
-  if (replyTo?.text && replyTo.text.startsWith('enc:v1:')) {
+  if (replyTo?.text && (replyTo.text.startsWith('enc:v1:') || replyTo.text.startsWith('enc:js1:'))) {
     replyTo = {
       ...replyTo,
       text: await decryptTextE2EE(replyTo.text),
@@ -146,8 +169,49 @@ async function decryptMessagesList(msgs: ChatMessage[]): Promise<ChatMessage[]> 
   return Promise.all(msgs.map(decryptMessageIfNeeded));
 }
 
+async function syncIncomingMessages(incoming: ChatMessage[]) {
+  if (!Array.isArray(incoming) || incoming.length === 0) return;
+  const current = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
+  const map = new Map<string, ChatMessage>();
+  current.forEach((m) => map.set(m.id, m));
+
+  let changed = false;
+  const pendingDecrypt: ChatMessage[] = [];
+
+  for (const inc of incoming) {
+    const existing = map.get(inc.id);
+    if (!existing) {
+      pendingDecrypt.push(inc);
+      changed = true;
+    } else {
+      const statusChanged = inc.status && existing.status !== inc.status;
+      const reactionsChanged =
+        inc.reactions &&
+        JSON.stringify(existing.reactions || {}) !== JSON.stringify(inc.reactions || {});
+      if (statusChanged || reactionsChanged) {
+        map.set(inc.id, {
+          ...existing,
+          status: inc.status || existing.status,
+          reactions: inc.reactions || existing.reactions,
+        });
+        changed = true;
+      }
+    }
+  }
+
+  if (pendingDecrypt.length > 0) {
+    const decrypted = await decryptMessagesList(pendingDecrypt);
+    decrypted.forEach((m) => map.set(m.id, m));
+  }
+
+  if (changed) {
+    const sorted = Array.from(map.values()).sort((a, b) => a.createdAt - b.createdAt);
+    writeLocal('messages', sorted, true);
+  }
+}
+
 // ----------------------------------------------------------------------------
-// Instant Server-Sent Events (SSE) Client (< 40ms Delivery)
+// Instant Server-Sent Events (SSE) Client & High-Frequency Sync Engine
 // ----------------------------------------------------------------------------
 
 async function postApiSync(body: Record<string, unknown>) {
@@ -166,12 +230,13 @@ async function postApiSync(body: Record<string, unknown>) {
 let sseInitialized = false;
 
 function initRealtimeSse() {
-  if (typeof window === 'undefined' || typeof EventSource === 'undefined' || sseInitialized) return;
+  if (typeof window === 'undefined' || sseInitialized) return;
   sseInitialized = true;
 
   let es: EventSource | null = null;
 
   const connect = () => {
+    if (typeof EventSource === 'undefined') return;
     try {
       es = new EventSource('/api/sync?stream=true');
 
@@ -182,8 +247,7 @@ function initRealtimeSse() {
 
           if (type === 'init' && payload) {
             if (Array.isArray(payload.messages)) {
-              const decrypted = await decryptMessagesList(payload.messages);
-              writeLocal('messages', decrypted, true);
+              await syncIncomingMessages(payload.messages);
             }
             if (payload.presence) {
               (['avinash', 'athulya'] as MemberId[]).forEach((m) => {
@@ -204,13 +268,8 @@ function initRealtimeSse() {
               writeLocal('game_invite', payload.activeInvite, true);
             }
           } else if (type === 'new_message' && payload) {
-            // Instant message push!
-            const decrypted = await decryptMessageIfNeeded(payload as ChatMessage);
-            const current = readLocal<ChatMessage[]>('messages', []);
-            const map = new Map<string, ChatMessage>();
-            [...current, decrypted].forEach((m) => map.set(m.id, m));
-            const merged = Array.from(map.values()).sort((a, b) => a.createdAt - b.createdAt);
-            writeLocal('messages', merged, true);
+            // Instant cross-device message push!
+            await syncIncomingMessages([payload as ChatMessage]);
           } else if (type === 'presence' && payload) {
             writeLocal(`presence_${payload.memberId}`, payload.presence, true);
           } else if (type === 'active_call') {
@@ -225,13 +284,13 @@ function initRealtimeSse() {
             writeLocal('game_invite', payload, true);
           } else if (type === 'mark_status' && payload) {
             const ids = new Set(payload.messageIds || []);
-            const current = readLocal<ChatMessage[]>('messages', []);
+            const current = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
             const updated = current.map((m) =>
               ids.has(m.id) ? { ...m, status: payload.status } : m
             );
             writeLocal('messages', updated, true);
           } else if (type === 'reaction' && payload) {
-            const current = readLocal<ChatMessage[]>('messages', []);
+            const current = readLocal<ChatMessage[]>('messages', SEED_MESSAGES);
             const updated = current.map((m) => {
               if (m.id !== payload.messageId) return m;
               const reactions = { ...(m.reactions || {}) };
@@ -252,36 +311,66 @@ function initRealtimeSse() {
       };
 
       es.onerror = () => {
-        if (es?.readyState === EventSource.CLOSED) {
-          es.close();
+        if (es?.readyState === EventSource.CLOSED || es?.readyState === EventSource.CONNECTING) {
+          try {
+            es?.close();
+          } catch {
+            // ignore
+          }
           es = null;
-          window.setTimeout(connect, 2000);
+          window.setTimeout(connect, 1000);
         }
       };
     } catch {
-      // fallback
+      // fallback to polling
     }
   };
 
   connect();
 
-  // Safety net fallback poll (every 3s)
-  window.setInterval(async () => {
+  // High-frequency realtime polling fallback (350ms active, 1200ms background)
+  // Ensures messages are received immediately (< 400ms) on all devices and networks
+  const pollServer = async () => {
     try {
       const res = await fetch('/api/sync', { cache: 'no-store' });
       if (!res.ok) return;
       const data = await res.json();
-      if (Array.isArray(data.messages)) {
-        const local = readLocal<ChatMessage[]>('messages', []);
-        if (data.messages.length > local.length) {
-          const decrypted = await decryptMessagesList(data.messages);
-          writeLocal('messages', decrypted, true);
-        }
+      if (Array.isArray(data.messages) && data.messages.length > 0) {
+        await syncIncomingMessages(data.messages);
+      }
+      if (data.presence) {
+        (['avinash', 'athulya'] as MemberId[]).forEach((m) => {
+          if (data.presence[m]) {
+            writeLocal(`presence_${m}`, data.presence[m], true);
+          }
+        });
+      }
+      if ('activeCall' in data) {
+        writeLocal('active_call', data.activeCall, true);
+      }
+      if (data.games) {
+        Object.entries(data.games).forEach(([gid, gstate]) => {
+          writeLocal(`game_${gid}`, gstate, true);
+        });
+      }
+      if ('activeInvite' in data) {
+        writeLocal('game_invite', data.activeInvite, true);
       }
     } catch {
       // ignore
     }
-  }, 3000);
+  };
+
+  pollServer();
+  window.setInterval(() => {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    pollServer();
+  }, 350);
+
+  window.setInterval(() => {
+    if (typeof document !== 'undefined' && !document.hidden) return;
+    pollServer();
+  }, 1200);
 }
 
 if (typeof window !== 'undefined') {
@@ -466,31 +555,8 @@ export async function updatePresence(memberId: MemberId, partial: Partial<Member
 }
 
 // ============================================================================
-// Realtime Chat Messages (End-to-End Encrypted with AES-GCM)
+// Realtime Chat Messages (End-to-End Encrypted)
 // ============================================================================
-
-const SEED_MESSAGES: ChatMessage[] = [
-  {
-    id: 'welcome-1',
-    senderId: 'avinash',
-    senderName: 'Avinash',
-    text: 'Welcome to Our Little Universe 💗 Just the two of us, forever.',
-    mediaType: 'text',
-    createdAt: 1739491200000,
-    status: 'seen',
-    reactions: { athulya: '🌹' },
-  },
-  {
-    id: 'welcome-2',
-    senderId: 'athulya',
-    senderName: 'Athulya',
-    text: 'My favorite little corner of the world 🌹✨ Missed you today!',
-    mediaType: 'text',
-    createdAt: 1739577600000,
-    status: 'seen',
-    reactions: { avinash: '💗' },
-  },
-];
 
 export function subscribeMessages(
   limitCount: number,

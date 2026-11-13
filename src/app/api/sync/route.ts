@@ -37,9 +37,9 @@ interface ServerSyncStore {
   lastUpdated: number;
 }
 
-// Preserve state across requests in Node server process
 declare global {
   var __OLU_STORE__: ServerSyncStore | undefined;
+  var __OLU_SSE_CLIENTS__: Set<ReadableStreamDefaultController> | undefined;
 }
 
 const SEED_CHAT_MESSAGES: ChatMessage[] = [
@@ -96,9 +96,83 @@ function getStore(): ServerSyncStore {
   return global.__OLU_STORE__;
 }
 
+function getSseClients(): Set<ReadableStreamDefaultController> {
+  if (!global.__OLU_SSE_CLIENTS__) {
+    global.__OLU_SSE_CLIENTS__ = new Set();
+  }
+  return global.__OLU_SSE_CLIENTS__;
+}
+
+const encoder = new TextEncoder();
+
+function broadcastEvent(type: string, payload: unknown) {
+  const clients = getSseClients();
+  const chunk = encoder.encode(
+    `data: ${JSON.stringify({ type, payload, timestamp: Date.now() })}\n\n`
+  );
+  clients.forEach((controller) => {
+    try {
+      controller.enqueue(chunk);
+    } catch {
+      clients.delete(controller);
+    }
+  });
+}
+
 export async function GET(req: NextRequest) {
   const store = getStore();
   const url = new URL(req.url);
+
+  // Real-Time Server-Sent Events (SSE) Stream
+  if (url.searchParams.get('stream') === 'true') {
+    const clients = getSseClients();
+    let clientController: ReadableStreamDefaultController | null = null;
+
+    const stream = new ReadableStream({
+      start(controller) {
+        clientController = controller;
+        clients.add(controller);
+
+        // Immediate initial handshake payload
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: 'init',
+              payload: {
+                messages: store.messages,
+                presence: store.presence,
+                activeCall: store.activeCall,
+                iceCandidates: store.iceCandidates,
+                games: store.games,
+                activeInvite: store.activeInvite,
+                gameHistory: store.gameHistory,
+                customCards: store.customCards,
+                memories: store.memories,
+                config: store.config,
+                lastUpdated: store.lastUpdated,
+              },
+              timestamp: Date.now(),
+            })}\n\n`
+          )
+        );
+      },
+      cancel() {
+        if (clientController) {
+          clients.delete(clientController);
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      },
+    });
+  }
+
+  // Fallback snapshot polling
   const since = Number(url.searchParams.get('since') || '0');
 
   return NextResponse.json({
@@ -136,10 +210,11 @@ export async function POST(req: NextRequest) {
         createdAt: body.msg.createdAt || Date.now(),
       };
       store.messages.push(msg);
-      // Keep up to 500 messages in memory
       if (store.messages.length > 500) {
         store.messages = store.messages.slice(-500);
       }
+      // Instant push to all connected partners!
+      broadcastEvent('new_message', msg);
       return NextResponse.json({ ok: true, message: msg });
     }
 
@@ -148,6 +223,7 @@ export async function POST(req: NextRequest) {
       store.messages = store.messages.map((m) =>
         ids.has(m.id) ? { ...m, status: body.status } : m
       );
+      broadcastEvent('mark_status', { messageIds: body.messageIds, status: body.status });
       return NextResponse.json({ ok: true });
     }
 
@@ -162,11 +238,17 @@ export async function POST(req: NextRequest) {
         }
         return { ...m, reactions };
       });
+      broadcastEvent('reaction', {
+        messageId: body.messageId,
+        memberId: body.memberId,
+        emoji: body.emoji,
+      });
       return NextResponse.json({ ok: true });
     }
 
     case 'clear_chat': {
       store.messages = [];
+      broadcastEvent('clear_chat', {});
       return NextResponse.json({ ok: true });
     }
 
@@ -178,6 +260,7 @@ export async function POST(req: NextRequest) {
           ...body.presence,
           memberId: member,
         };
+        broadcastEvent('presence', { memberId: member, presence: store.presence[member] });
       }
       return NextResponse.json({ ok: true });
     }
@@ -189,6 +272,7 @@ export async function POST(req: NextRequest) {
       } else if (body.call.id && store.iceCandidates.callId !== body.call.id) {
         store.iceCandidates = { callId: body.call.id, offerCandidates: [], answerCandidates: [] };
       }
+      broadcastEvent('active_call', store.activeCall);
       return NextResponse.json({ ok: true });
     }
 
@@ -200,50 +284,64 @@ export async function POST(req: NextRequest) {
         } else if (role === 'answerCandidates') {
           store.iceCandidates.answerCandidates.push(body.candidate);
         }
+        broadcastEvent('ice_candidate', {
+          callId: body.callId,
+          role: body.role,
+          candidate: body.candidate,
+        });
       }
       return NextResponse.json({ ok: true });
     }
 
     case 'save_game': {
       store.games[body.gameId] = body.state;
+      broadcastEvent('game_state', { gameId: body.gameId, state: body.state });
       return NextResponse.json({ ok: true });
     }
 
     case 'send_invite': {
       store.activeInvite = body.invite || null;
+      broadcastEvent('game_invite', store.activeInvite);
       return NextResponse.json({ ok: true });
     }
 
     case 'add_history': {
-      store.gameHistory.unshift({
+      const entry: GameHistoryEntry = {
         id: `gh-${Date.now()}`,
         ...body.entry,
-      });
+      };
+      store.gameHistory.unshift(entry);
       if (store.gameHistory.length > 50) {
         store.gameHistory = store.gameHistory.slice(0, 50);
       }
+      broadcastEvent('game_history', entry);
       return NextResponse.json({ ok: true });
     }
 
     case 'add_custom_card': {
-      store.customCards.push({
+      const card: TruthOrDareCard = {
         id: `custom-${Date.now()}`,
         ...body.card,
         isCustom: true,
-      });
+      };
+      store.customCards.push(card);
+      broadcastEvent('custom_card', card);
       return NextResponse.json({ ok: true });
     }
 
     case 'add_memory': {
-      store.memories.unshift({
+      const memory: MemoryItem = {
         id: `mem-${Date.now()}`,
         ...body.memory,
-      });
+      };
+      store.memories.unshift(memory);
+      broadcastEvent('memory', memory);
       return NextResponse.json({ ok: true });
     }
 
     case 'delete_memory': {
       store.memories = store.memories.filter((m) => m.id !== body.id);
+      broadcastEvent('delete_memory', { id: body.id });
       return NextResponse.json({ ok: true });
     }
 
@@ -252,6 +350,7 @@ export async function POST(req: NextRequest) {
         ...store.config,
         ...body.config,
       };
+      broadcastEvent('config', store.config);
       return NextResponse.json({ ok: true });
     }
 
@@ -259,4 +358,3 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
   }
 }
-

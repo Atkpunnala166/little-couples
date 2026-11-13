@@ -9,6 +9,7 @@ import {
   CheckCheck,
   Heart,
   Image as ImageIcon,
+  Lock,
   Mic,
   Music,
   Phone,
@@ -427,6 +428,13 @@ export function ChatTab() {
         onScroll={handleScroll}
         className="relative flex-1 overflow-y-auto px-3 sm:px-4 py-4 space-y-3"
       >
+        <div className="flex justify-center pb-1">
+          <div className="inline-flex items-center gap-1.5 rounded-full bg-black/40 border border-pink-500/25 px-3 py-1 text-[11px] text-pink-200/80 backdrop-blur-md">
+            <Lock className="h-3 w-3 text-pink-400" />
+            <span>End-to-End Encrypted • Only Avinash &amp; Athulya</span>
+          </div>
+        </div>
+
         {hasMoreMessages && (
           <div className="text-center pb-2">
             <button

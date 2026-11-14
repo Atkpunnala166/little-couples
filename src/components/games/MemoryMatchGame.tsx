@@ -8,6 +8,7 @@ import { MEMORY_FALLBACK_SYMBOLS, nowMs, PROFILE_META } from '@/lib/constants';
 import { soundEngine } from '@/lib/audio';
 import {
   addGameHistory,
+  clearGameState,
   saveGameState,
   subscribeGameState,
   subscribeMemories,
@@ -166,6 +167,7 @@ export function MemoryMatchGame() {
   };
 
   const handleNewGame = async () => {
+    await clearGameState('memory-match');
     await saveGameState<MemoryMatchState>('memory-match', {
       cards: buildShuffledDeck(memories),
       flippedIndices: [],

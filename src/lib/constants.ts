@@ -5,6 +5,7 @@ import {
   LoveQuizState,
   MemberId,
   MemoryItem,
+  MemoryMatchState,
   ThemeId,
   TicTacToeState,
   TruthOrDareCard,
@@ -481,6 +482,26 @@ export const MEMORY_FALLBACK_SYMBOLS = [
   { pairId: 'letter', label: 'Love Note', emoji: '💌' },
   { pairId: 'ring', label: 'Forever', emoji: '💍' },
 ];
+
+export const INITIAL_MEMORY_MATCH: MemoryMatchState = {
+  cards: [
+    ...MEMORY_FALLBACK_SYMBOLS,
+    ...MEMORY_FALLBACK_SYMBOLS,
+  ].map((sym, idx) => ({
+    id: idx,
+    pairId: sym.pairId,
+    label: sym.label,
+    emoji: sym.emoji,
+    flipped: false,
+    matchedBy: null,
+  })),
+  flippedIndices: [],
+  turn: 'avinash',
+  scores: { avinash: 0, athulya: 0 },
+  winner: null,
+  moves: 0,
+  updatedAt: 0,
+};
 
 export const nowMs = (): number => Date.now();
 

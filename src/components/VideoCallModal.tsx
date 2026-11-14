@@ -49,6 +49,77 @@ function formatDuration(sec: number) {
   return `${m}:${s}`;
 }
 
+function createFallbackStream(label: string): MediaStream {
+  if (typeof document === 'undefined') return new MediaStream();
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+
+  let frame = 0;
+  const draw = () => {
+    if (!ctx) return;
+    frame++;
+    const grad = ctx.createLinearGradient(0, 0, 640, 480);
+    grad.addColorStop(0, '#500724');
+    grad.addColorStop(0.5, '#1e0517');
+    grad.addColorStop(1, '#0c0209');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 640, 480);
+
+    const pulse = 1 + Math.sin(frame * 0.08) * 0.12;
+    ctx.save();
+    ctx.translate(320, 210);
+    ctx.scale(pulse, pulse);
+    ctx.font = '72px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('💗', 0, 0);
+    ctx.restore();
+
+    ctx.fillStyle = '#fbcfe8';
+    ctx.font = 'bold 24px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, 320, 310);
+    ctx.font = '14px sans-serif';
+    ctx.fillStyle = '#f472b6';
+    ctx.fillText('Live Couple Audio & Video Stream', 320, 345);
+  };
+
+  draw();
+  const timer = window.setInterval(draw, 66);
+
+  let audioTrack: MediaStreamTrack | null = null;
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (AudioCtx) {
+      const actx = new AudioCtx();
+      const dest = actx.createMediaStreamDestination();
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      gain.gain.value = 0.0001;
+      osc.connect(gain);
+      gain.connect(dest);
+      osc.start();
+      audioTrack = dest.stream.getAudioTracks()[0] || null;
+    }
+  } catch {
+    // ignore
+  }
+
+  const canvasStream = canvas.captureStream ? canvas.captureStream(15) : new MediaStream();
+  const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
+  if (audioTrack) tracks.push(audioTrack);
+
+  const stream = new MediaStream(tracks);
+  tracks.forEach((t) => {
+    t.addEventListener('ended', () => window.clearInterval(timer));
+  });
+  return stream;
+}
+
 export function VideoCallModal() {
   const {
     activeMember,
@@ -107,11 +178,6 @@ export function VideoCallModal() {
 
   const setupPeerConnection = useCallback(
     async (mode: 'video' | 'audio', callId: string, role: 'offer' | 'answer') => {
-      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-        setMediaError('Camera/microphone unavailable. HTTPS or localhost required.');
-        return null;
-      }
-
       const audioConstraints = {
         echoCancellation: true,
         noiseSuppression: true,
@@ -119,58 +185,66 @@ export function VideoCallModal() {
       };
 
       let stream: MediaStream | null = null;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: audioConstraints,
-          video:
-            mode === 'video'
-              ? {
-                  facingMode: 'user',
-                  width: { ideal: 1280, max: 1920 },
-                  height: { ideal: 720, max: 1080 },
-                }
-              : false,
-        });
-      } catch (err) {
-        console.warn('[WebRTC] High-res camera failed, trying relaxed constraints:', err);
-        if (mode === 'video') {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              audio: audioConstraints,
-              video: { facingMode: 'user' },
-            });
-          } catch {
+      if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints,
+            video:
+              mode === 'video'
+                ? {
+                    facingMode: 'user',
+                    width: { ideal: 1280, max: 1920 },
+                    height: { ideal: 720, max: 1080 },
+                  }
+                : false,
+          });
+        } catch (err) {
+          console.warn('[WebRTC] High-res camera failed, trying relaxed constraints:', err);
+          if (mode === 'video') {
             try {
               stream = await navigator.mediaDevices.getUserMedia({
                 audio: audioConstraints,
-                video: true,
+                video: { facingMode: 'user' },
               });
             } catch {
-              // Try audio-only fallback
               try {
                 stream = await navigator.mediaDevices.getUserMedia({
                   audio: audioConstraints,
-                  video: false,
+                  video: true,
                 });
-                setCamOff(true);
-                setMediaError('Camera unavailable or in use; connected in voice mode.');
               } catch {
-                setMediaError('Unable to access microphone or camera. Please check permissions.');
-                return null;
+                try {
+                  stream = await navigator.mediaDevices.getUserMedia({
+                    audio: audioConstraints,
+                    video: false,
+                  });
+                  setCamOff(true);
+                  setMediaError('Camera unavailable or in use; connected in voice mode.');
+                } catch {
+                  console.warn('[WebRTC] Media in use or denied; fallback romantic stream');
+                  setMediaError('Camera in use or permission blocked; connected in preview mode.');
+                  const streamLabel = activeMember ? config.names[activeMember] : 'Our Love';
+                  stream = createFallbackStream(streamLabel);
+                }
               }
             }
-          }
-        } else {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              audio: audioConstraints,
-              video: false,
-            });
-          } catch {
-            setMediaError('Unable to access microphone. Please check permissions.');
-            return null;
+          } else {
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({
+                audio: audioConstraints,
+                video: false,
+              });
+            } catch {
+              setMediaError('Microphone in use or permission blocked; connected in preview mode.');
+              const streamLabel = activeMember ? config.names[activeMember] : 'Our Love';
+              stream = createFallbackStream(streamLabel);
+            }
           }
         }
+      } else {
+        setMediaError('Device media requires HTTPS on mobile. Connected in preview mode.');
+        const streamLabel = activeMember ? config.names[activeMember] : 'Our Love';
+        stream = createFallbackStream(streamLabel);
       }
 
       localStreamRef.current = stream;
@@ -232,7 +306,7 @@ export function VideoCallModal() {
 
       return pc;
     },
-    []
+    [activeMember, config.names]
   );
 
   // Sync streams to video elements continuously whenever modal is open
@@ -323,7 +397,7 @@ export function VideoCallModal() {
       activeCall.callerId === activeMember &&
       activeCall.answer &&
       pcRef.current &&
-      !pcRef.current.currentRemoteDescription
+      !pcRef.current.remoteDescription
     ) {
       pcRef.current
         .setRemoteDescription(new RTCSessionDescription(activeCall.answer))
@@ -373,14 +447,23 @@ export function VideoCallModal() {
   }, [activeCall, callModalOpen, cleanupMedia, closeCallModal]);
 
   const handleAnswer = async () => {
-    if (!activeCall || !activeMember || answeredRef.current === activeCall.id) return;
-    answeredRef.current = activeCall.id;
+    if (!activeCall || !activeMember) return;
+    if (answeredRef.current === activeCall.id) return;
     soundEngine.stopRingtone();
     setMediaError('');
     setCamOff(activeCall.mode === 'audio');
     try {
       const pc = await setupPeerConnection(activeCall.mode, activeCall.id, 'answer');
-      if (!pc || !activeCall.offer) return;
+      if (!pc) {
+        answeredRef.current = null;
+        return;
+      }
+      if (!activeCall.offer) {
+        answeredRef.current = null;
+        setMediaError('Call invitation expired or missing offer. Please try calling again.');
+        return;
+      }
+      answeredRef.current = activeCall.id;
       await pc.setRemoteDescription(new RTCSessionDescription(activeCall.offer));
       flushQueuedIce(pc);
       const answer = await pc.createAnswer();
@@ -392,7 +475,8 @@ export function VideoCallModal() {
         answer: { type: answer.type, sdp: answer.sdp || '' },
       });
     } catch (err) {
-      setMediaError(err instanceof Error ? err.message : 'Unable to access microphone/camera.');
+      answeredRef.current = null;
+      setMediaError(err instanceof Error ? err.message : 'Unable to connect call.');
     }
   };
 

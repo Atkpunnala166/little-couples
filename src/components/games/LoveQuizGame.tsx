@@ -10,7 +10,7 @@ import {
   PROFILE_META,
 } from '@/lib/constants';
 import { soundEngine } from '@/lib/audio';
-import { addGameHistory, saveGameState, subscribeGameState } from '@/lib/store';
+import { addGameHistory, clearGameState, saveGameState, subscribeGameState } from '@/lib/store';
 import { useUniverse } from '@/context/UniverseContext';
 import { LoveQuizState } from '@/types/universe';
 
@@ -102,10 +102,7 @@ export function LoveQuizGame() {
   };
 
   const handleReset = async () => {
-    await saveGameState<LoveQuizState>('love-quiz', {
-      ...INITIAL_LOVE_QUIZ,
-      updatedAt: Date.now(),
-    });
+    await clearGameState('love-quiz');
   };
 
   const myAnswerCount =

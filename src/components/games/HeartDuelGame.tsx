@@ -6,7 +6,7 @@ import { motion } from 'framer-motion';
 import { Flame, Play, Trophy } from 'lucide-react';
 import { INITIAL_HEART_DUEL, nowMs } from '@/lib/constants';
 import { soundEngine } from '@/lib/audio';
-import { addGameHistory, saveGameState, subscribeGameState } from '@/lib/store';
+import { addGameHistory, clearGameState, saveGameState, subscribeGameState } from '@/lib/store';
 import { useUniverse } from '@/context/UniverseContext';
 import { HeartDuelState } from '@/types/universe';
 
@@ -253,6 +253,15 @@ export function HeartDuelGame() {
               >
                 <Play className="h-3.5 w-3.5" />
                 <span>{duel.status === 'playing' ? 'New Duel Challenge' : 'Start Duel'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  await clearGameState('heart-duel');
+                }}
+                className="rounded-full bg-white/10 hover:bg-rose-500/25 border border-white/15 px-4 py-2.5 text-xs font-medium text-pink-200/80 flex items-center gap-1.5 transition"
+              >
+                <span>Clear Duel</span>
               </button>
             </div>
           </div>

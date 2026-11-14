@@ -12,6 +12,7 @@ import { soundEngine } from '@/lib/audio';
 import {
   addCustomCard,
   addGameHistory,
+  clearGameState,
   saveGameState,
   subscribeCustomCards,
   subscribeGameState,
@@ -232,6 +233,18 @@ export function TruthOrDareGame() {
           className="rounded-2xl bg-white/10 hover:bg-rose-500/25 border border-white/15 py-3 text-xs sm:text-sm font-semibold text-white transition"
         >
           Draw Dare
+        </button>
+      </div>
+
+      <div className="flex justify-center">
+        <button
+          type="button"
+          onClick={async () => {
+            await clearGameState('truth-or-dare');
+          }}
+          className="rounded-full bg-white/5 hover:bg-rose-500/20 border border-white/10 px-4 py-2 text-xs font-medium text-pink-200/70 transition"
+        >
+          <span>Reset Deck</span>
         </button>
       </div>
     </div>

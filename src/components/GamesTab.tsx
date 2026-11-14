@@ -2,9 +2,9 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { ArrowLeft, BellRing, History, Play, Trophy } from 'lucide-react';
+import { ArrowLeft, BellRing, History, Play, RotateCcw, Trophy } from 'lucide-react';
 import { GAME_CATALOG, nowMs, PROFILE_META } from '@/lib/constants';
-import { sendGameInvite, subscribeGameHistory } from '@/lib/store';
+import { clearAllGameStates, sendGameInvite, subscribeGameHistory } from '@/lib/store';
 import { useUniverse } from '@/context/UniverseContext';
 import { GameHistoryEntry, GameId } from '@/types/universe';
 import { TicTacToeGame } from './games/TicTacToeGame';
@@ -119,18 +119,38 @@ export function GamesTab() {
           </h2>
         </div>
 
-        <div className="flex items-center gap-4 rounded-2xl bg-black/35 border border-white/10 px-4 py-2.5">
-          <Trophy className="h-5 w-5 text-amber-300 shrink-0" />
-          <div className="flex items-center gap-3 text-xs">
-            <span>
-              <strong className="text-pink-200">{config.names.avinash} 💗:</strong>{' '}
-              <span className="text-white font-bold">{totalWins.avinash}</span>
-            </span>
-            <span className="text-white/25">|</span>
-            <span>
-              <strong className="text-rose-200">{config.names.athulya} 🌹:</strong>{' '}
-              <span className="text-white font-bold">{totalWins.athulya}</span>
-            </span>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={async () => {
+              await clearAllGameStates();
+              pushToast({
+                title: '✨ All Games Cleared',
+                body: 'All boards and scores have been reset to a fresh state!',
+                icon: '🔄',
+                targetTab: 'games',
+              });
+            }}
+            className="rounded-full bg-white/10 hover:bg-rose-500/25 border border-white/15 px-3 py-1.5 text-xs font-medium text-pink-200 flex items-center gap-1.5 transition"
+            title="Reset All Games to Clean State"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            <span>Clear All Games</span>
+          </button>
+
+          <div className="flex items-center gap-4 rounded-2xl bg-black/35 border border-white/10 px-4 py-2.5">
+            <Trophy className="h-5 w-5 text-amber-300 shrink-0" />
+            <div className="flex items-center gap-3 text-xs">
+              <span>
+                <strong className="text-pink-200">{config.names.avinash} 💗:</strong>{' '}
+                <span className="text-white font-bold">{totalWins.avinash}</span>
+              </span>
+              <span className="text-white/25">|</span>
+              <span>
+                <strong className="text-rose-200">{config.names.athulya} 🌹:</strong>{' '}
+                <span className="text-white font-bold">{totalWins.athulya}</span>
+              </span>
+            </div>
           </div>
         </div>
       </div>

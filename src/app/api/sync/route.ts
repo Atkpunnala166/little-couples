@@ -4,6 +4,7 @@ import {
   DEFAULT_MEMORIES,
   INITIAL_HEART_DUEL,
   INITIAL_LOVE_QUIZ,
+  INITIAL_MEMORY_MATCH,
   INITIAL_TIC_TAC_TOE,
   INITIAL_TRUTH_OR_DARE,
 } from '@/lib/constants';
@@ -84,6 +85,7 @@ function getStore(): ServerSyncStore {
         'heart-duel': INITIAL_HEART_DUEL,
         'truth-or-dare': INITIAL_TRUTH_OR_DARE,
         'love-quiz': INITIAL_LOVE_QUIZ,
+        'memory-match': INITIAL_MEMORY_MATCH,
       },
       activeInvite: null,
       gameHistory: [],
@@ -296,9 +298,42 @@ export async function POST(req: NextRequest) {
     }
 
     case 'save_game': {
-      store.games[body.gameId] = body.state;
-      broadcastEvent('game_state', { gameId: body.gameId, state: body.state });
+      const incomingState = body.state as Record<string, unknown>;
+      const existingState = store.games[body.gameId] as Record<string, unknown> | undefined;
+      const incomingTs = Number(incomingState?.updatedAt || 0);
+      const existingTs = Number(existingState?.updatedAt || 0);
+
+      // Only update store if incoming state is newer or equal
+      if (incomingTs >= existingTs || !existingTs) {
+        store.games[body.gameId] = incomingState;
+      }
+      broadcastEvent('game_state', { gameId: body.gameId, state: store.games[body.gameId] });
       return NextResponse.json({ ok: true });
+    }
+
+    case 'clear_game': {
+      const gid = body.gameId as string;
+      const now = Date.now();
+      if (gid === 'tic-tac-toe') store.games['tic-tac-toe'] = { ...INITIAL_TIC_TAC_TOE, updatedAt: now };
+      else if (gid === 'heart-duel') store.games['heart-duel'] = { ...INITIAL_HEART_DUEL, updatedAt: now };
+      else if (gid === 'truth-or-dare') store.games['truth-or-dare'] = { ...INITIAL_TRUTH_OR_DARE, updatedAt: now };
+      else if (gid === 'love-quiz') store.games['love-quiz'] = { ...INITIAL_LOVE_QUIZ, updatedAt: now };
+      else if (gid === 'memory-match') store.games['memory-match'] = { ...INITIAL_MEMORY_MATCH, updatedAt: now };
+      broadcastEvent('game_state', { gameId: gid, state: store.games[gid] });
+      return NextResponse.json({ ok: true, state: store.games[gid] });
+    }
+
+    case 'clear_all_games': {
+      const now = Date.now();
+      store.games = {
+        'tic-tac-toe': { ...INITIAL_TIC_TAC_TOE, updatedAt: now },
+        'heart-duel': { ...INITIAL_HEART_DUEL, updatedAt: now },
+        'truth-or-dare': { ...INITIAL_TRUTH_OR_DARE, updatedAt: now },
+        'love-quiz': { ...INITIAL_LOVE_QUIZ, updatedAt: now },
+        'memory-match': { ...INITIAL_MEMORY_MATCH, updatedAt: now },
+      };
+      broadcastEvent('clear_all_games', store.games);
+      return NextResponse.json({ ok: true, games: store.games });
     }
 
     case 'send_invite': {

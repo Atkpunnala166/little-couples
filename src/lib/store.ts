@@ -22,6 +22,11 @@ import {
 import {
   DEFAULT_COUPLE_CONFIG,
   DEFAULT_MEMORIES,
+  INITIAL_HEART_DUEL,
+  INITIAL_LOVE_QUIZ,
+  INITIAL_MEMORY_MATCH,
+  INITIAL_TIC_TAC_TOE,
+  INITIAL_TRUTH_OR_DARE,
 } from '@/lib/constants';
 import {
   decryptTextE2EE,
@@ -248,6 +253,16 @@ export async function postGlobalSync(body: Record<string, unknown>) {
 // Deprecated alias for backwards compatibility
 export const postApiSync = postGlobalSync;
 
+function syncIncomingGameState(gameId: string, incoming: Record<string, unknown>) {
+  if (!incoming || typeof incoming !== 'object') return;
+  const current = readLocal<Record<string, unknown>>(`game_${gameId}`, {});
+  const currentUpdated = Number(current?.updatedAt || 0);
+  const incomingUpdated = Number(incoming?.updatedAt || 0);
+  if (incomingUpdated >= currentUpdated || !currentUpdated) {
+    writeLocal(`game_${gameId}`, incoming, true);
+  }
+}
+
 async function handleIncomingRelayPayload(data: Record<string, unknown>) {
   if (!data || typeof data !== 'object') return;
   const action = (data.action || data.type) as string;
@@ -279,10 +294,28 @@ async function handleIncomingRelayPayload(data: Record<string, unknown>) {
     }
   } else if (action === 'save_game' || action === 'game_state') {
     const gameId = (data.gameId || (data.payload as Record<string, unknown>)?.gameId) as string;
-    const state = data.state || (data.payload as Record<string, unknown>)?.state;
+    const state = (data.state || (data.payload as Record<string, unknown>)?.state) as Record<string, unknown>;
     if (gameId && state) {
-      writeLocal(`game_${gameId}`, state, true);
+      syncIncomingGameState(gameId, state);
     }
+  } else if (action === 'clear_game') {
+    const gameId = data.gameId as string;
+    if (gameId) {
+      let initial: Record<string, unknown> = {};
+      if (gameId === 'tic-tac-toe') initial = { ...INITIAL_TIC_TAC_TOE, updatedAt: Date.now() };
+      else if (gameId === 'heart-duel') initial = { ...INITIAL_HEART_DUEL, updatedAt: Date.now() };
+      else if (gameId === 'truth-or-dare') initial = { ...INITIAL_TRUTH_OR_DARE, updatedAt: Date.now() };
+      else if (gameId === 'love-quiz') initial = { ...INITIAL_LOVE_QUIZ, updatedAt: Date.now() };
+      else if (gameId === 'memory-match') initial = { ...INITIAL_MEMORY_MATCH, updatedAt: Date.now() };
+      writeLocal(`game_${gameId}`, initial, true);
+    }
+  } else if (action === 'clear_all_games') {
+    const now = Date.now();
+    writeLocal('game_tic-tac-toe', { ...INITIAL_TIC_TAC_TOE, updatedAt: now }, true);
+    writeLocal('game_heart-duel', { ...INITIAL_HEART_DUEL, updatedAt: now }, true);
+    writeLocal('game_truth-or-dare', { ...INITIAL_TRUTH_OR_DARE, updatedAt: now }, true);
+    writeLocal('game_love-quiz', { ...INITIAL_LOVE_QUIZ, updatedAt: now }, true);
+    writeLocal('game_memory-match', { ...INITIAL_MEMORY_MATCH, updatedAt: now }, true);
   } else if (action === 'send_invite' || action === 'game_invite') {
     const invite = (data.invite || data.payload) as GameInvite;
     writeLocal('game_invite', invite, true);
@@ -423,9 +456,36 @@ function initRealtimeEngines() {
             if ('activeCall' in payload) {
               writeLocal('active_call', payload.activeCall, true);
             }
+            if (payload.iceCandidates && payload.iceCandidates.callId) {
+              const { callId, offerCandidates, answerCandidates } = payload.iceCandidates;
+              if (Array.isArray(offerCandidates) && offerCandidates.length > 0) {
+                const key = `ice_${callId}_offerCandidates`;
+                const existing = readLocal<RTCIceCandidateInit[]>(key, []);
+                const merged = [...existing];
+                offerCandidates.forEach((cand: RTCIceCandidateInit) => {
+                  const candStr = cand.candidate || JSON.stringify(cand);
+                  if (!merged.some((c) => (c.candidate || JSON.stringify(c)) === candStr)) {
+                    merged.push(cand);
+                  }
+                });
+                if (merged.length !== existing.length) writeLocal(key, merged, true);
+              }
+              if (Array.isArray(answerCandidates) && answerCandidates.length > 0) {
+                const key = `ice_${callId}_answerCandidates`;
+                const existing = readLocal<RTCIceCandidateInit[]>(key, []);
+                const merged = [...existing];
+                answerCandidates.forEach((cand: RTCIceCandidateInit) => {
+                  const candStr = cand.candidate || JSON.stringify(cand);
+                  if (!merged.some((c) => (c.candidate || JSON.stringify(c)) === candStr)) {
+                    merged.push(cand);
+                  }
+                });
+                if (merged.length !== existing.length) writeLocal(key, merged, true);
+              }
+            }
             if (payload.games) {
               Object.entries(payload.games).forEach(([gid, gstate]) => {
-                writeLocal(`game_${gid}`, gstate, true);
+                syncIncomingGameState(gid, gstate as Record<string, unknown>);
               });
             }
             if ('activeInvite' in payload) {
@@ -440,9 +500,16 @@ function initRealtimeEngines() {
           } else if (type === 'ice_candidate' && payload) {
             const key = `ice_${payload.callId}_${payload.role}`;
             const existing = readLocal<RTCIceCandidateInit[]>(key, []);
-            writeLocal(key, [...existing, payload.candidate], true);
+            const candStr = payload.candidate?.candidate || JSON.stringify(payload.candidate);
+            if (!existing.some((c) => (c.candidate || JSON.stringify(c)) === candStr)) {
+              writeLocal(key, [...existing, payload.candidate], true);
+            }
           } else if (type === 'game_state' && payload) {
-            writeLocal(`game_${payload.gameId}`, payload.state, true);
+            syncIncomingGameState(payload.gameId, payload.state as Record<string, unknown>);
+          } else if (type === 'clear_all_games' && payload) {
+            Object.entries(payload).forEach(([gid, gstate]) => {
+              writeLocal(`game_${gid}`, gstate, true);
+            });
           } else if (type === 'game_invite') {
             writeLocal('game_invite', payload, true);
           } else if (type === 'mark_status' && payload) {
@@ -507,9 +574,36 @@ function initRealtimeEngines() {
       if ('activeCall' in data) {
         writeLocal('active_call', data.activeCall, true);
       }
+      if (data.iceCandidates && data.iceCandidates.callId) {
+        const { callId, offerCandidates, answerCandidates } = data.iceCandidates;
+        if (Array.isArray(offerCandidates) && offerCandidates.length > 0) {
+          const key = `ice_${callId}_offerCandidates`;
+          const existing = readLocal<RTCIceCandidateInit[]>(key, []);
+          const merged = [...existing];
+          offerCandidates.forEach((cand: RTCIceCandidateInit) => {
+            const candStr = cand.candidate || JSON.stringify(cand);
+            if (!merged.some((c) => (c.candidate || JSON.stringify(c)) === candStr)) {
+              merged.push(cand);
+            }
+          });
+          if (merged.length !== existing.length) writeLocal(key, merged, true);
+        }
+        if (Array.isArray(answerCandidates) && answerCandidates.length > 0) {
+          const key = `ice_${callId}_answerCandidates`;
+          const existing = readLocal<RTCIceCandidateInit[]>(key, []);
+          const merged = [...existing];
+          answerCandidates.forEach((cand: RTCIceCandidateInit) => {
+            const candStr = cand.candidate || JSON.stringify(cand);
+            if (!merged.some((c) => (c.candidate || JSON.stringify(c)) === candStr)) {
+              merged.push(cand);
+            }
+          });
+          if (merged.length !== existing.length) writeLocal(key, merged, true);
+        }
+      }
       if (data.games) {
         Object.entries(data.games).forEach(([gid, gstate]) => {
-          writeLocal(`game_${gid}`, gstate, true);
+          syncIncomingGameState(gid, gstate as Record<string, unknown>);
         });
       }
       if ('activeInvite' in data) {
@@ -955,7 +1049,8 @@ export function subscribeGameState<T>(
     doc(db, 'games', gameId),
     (snap) => {
       if (!snap.exists()) {
-        cb(initial);
+        const local = readLocal<T>(`game_${gameId}`, initial);
+        cb(local);
         return;
       }
       const state = { ...initial, ...(snap.data() as Partial<T>) };
@@ -980,6 +1075,60 @@ export async function saveGameState<T extends object>(gameId: GameId, state: T) 
     try {
       ensureAnonymousUser().catch(() => null);
       await setDoc(doc(db, 'games', gameId), state, { merge: true });
+    } catch {
+      // server sync active
+    }
+  }
+}
+
+export async function clearGameState(gameId: GameId) {
+  const now = Date.now();
+  let initial: Record<string, unknown> = {};
+  if (gameId === 'tic-tac-toe') initial = { ...INITIAL_TIC_TAC_TOE, updatedAt: now };
+  else if (gameId === 'heart-duel') initial = { ...INITIAL_HEART_DUEL, updatedAt: now };
+  else if (gameId === 'truth-or-dare') initial = { ...INITIAL_TRUTH_OR_DARE, updatedAt: now };
+  else if (gameId === 'love-quiz') initial = { ...INITIAL_LOVE_QUIZ, updatedAt: now };
+  else if (gameId === 'memory-match') initial = { ...INITIAL_MEMORY_MATCH, updatedAt: now };
+
+  writeLocal(`game_${gameId}`, initial, true);
+  postGlobalSync({ action: 'clear_game', gameId });
+
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      ensureAnonymousUser().catch(() => null);
+      await setDoc(doc(db, 'games', gameId), initial);
+    } catch {
+      // server sync active
+    }
+  }
+}
+
+export async function clearAllGameStates() {
+  const now = Date.now();
+  const allInitial: Record<GameId, Record<string, unknown>> = {
+    'tic-tac-toe': { ...INITIAL_TIC_TAC_TOE, updatedAt: now },
+    'heart-duel': { ...INITIAL_HEART_DUEL, updatedAt: now },
+    'truth-or-dare': { ...INITIAL_TRUTH_OR_DARE, updatedAt: now },
+    'love-quiz': { ...INITIAL_LOVE_QUIZ, updatedAt: now },
+    'memory-match': { ...INITIAL_MEMORY_MATCH, updatedAt: now },
+  };
+
+  Object.entries(allInitial).forEach(([gid, state]) => {
+    writeLocal(`game_${gid}`, state, true);
+  });
+
+  postGlobalSync({ action: 'clear_all_games' });
+
+  const db = getFirebaseDb();
+  if (isFirebaseConfigured && db) {
+    try {
+      ensureAnonymousUser().catch(() => null);
+      const batch = writeBatch(db);
+      Object.entries(allInitial).forEach(([gid, state]) => {
+        batch.set(doc(db, 'games', gid), state);
+      });
+      await batch.commit();
     } catch {
       // server sync active
     }

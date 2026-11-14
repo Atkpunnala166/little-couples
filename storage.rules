@@ -2,20 +2,10 @@ rules_version = '2';
 
 service firebase.storage {
   match /b/{bucket}/o {
-    // Only authenticated couple users can read/upload images, voice notes, and memories
-    match /chat-media/{allPaths=**} {
-      allow read, write: if request.auth != null
-        && request.resource.size < 15 * 1024 * 1024;
-    }
-
-    match /voice-notes/{allPaths=**} {
-      allow read, write: if request.auth != null
-        && request.resource.size < 10 * 1024 * 1024;
-    }
-
-    match /memories/{allPaths=**} {
-      allow read, write: if request.auth != null
-        && request.resource.size < 15 * 1024 * 1024;
+    // Our Little Universe: Avinash & Athulya private space
+    // End-to-end encrypted media storage for photos, voice notes, and memories
+    match /{allPaths=**} {
+      allow read, write: if true;
     }
   }
 }

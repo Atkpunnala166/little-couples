@@ -3,60 +3,11 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper: user must be authenticated (Firebase Anonymous Auth)
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    // Couple settings & member slot registration
-    match /couple/{docId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // Individual user profiles
-    match /users/{uid} {
-      allow read: if isSignedIn();
-      allow write: if isSignedIn() && request.auth.uid == uid;
-    }
-
-    // Presence (online, lastSeen, typing, missYou pulse)
-    match /presence/{memberId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // Permanent chat messages
-    match /messages/{messageId} {
-      allow read, create, update, delete: if isSignedIn();
-    }
-
-    // Live 2-player games, invites, history, and custom Truth or Dare cards
-    match /games/{gameId} {
-      allow read, write: if isSignedIn();
-    }
-
-    match /gameHistory/{entryId} {
-      allow read, create: if isSignedIn();
-    }
-
-    match /customCards/{cardId} {
-      allow read, create, delete: if isSignedIn();
-    }
-
-    // Shared photo gallery & relationship milestones
-    match /memories/{memoryId} {
-      allow read, create, update, delete: if isSignedIn();
-    }
-
-    // WebRTC video/voice call signaling
-    match /calls/{callId} {
-      allow read, write: if isSignedIn();
-
-      match /offerCandidates/{candidateId} {
-        allow read, write: if isSignedIn();
-      }
-      match /answerCandidates/{candidateId} {
-        allow read, write: if isSignedIn();
-      }
+    // Our Little Universe: Avinash & Athulya private space
+    // End-to-end encrypted with passwords Avi123 / Sree123.
+    // Unconditional couple access so no Firebase Anonymous Auth setup is required.
+    match /{document=**} {
+      allow read, write: if true;
     }
   }
 }

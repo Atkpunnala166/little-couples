@@ -58,8 +58,13 @@ export async function ensureAnonymousUser(): Promise<User | null> {
   const auth = getFirebaseAuth();
   if (!auth) return null;
   if (auth.currentUser) return auth.currentUser;
-  const cred = await signInAnonymously(auth);
-  return cred.user;
+  try {
+    const cred = await signInAnonymously(auth);
+    return cred.user;
+  } catch (err) {
+    console.warn('[Firebase] Anonymous sign-in notice (optional):', err);
+    return null;
+  }
 }
 
 export async function registerFcmPushToken(): Promise<string | null> {

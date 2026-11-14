@@ -21,7 +21,24 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
+    // Metered OpenRelay free public TURN servers for Symmetric NAT / 4G / 5G cellular traversal
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 10,
 };
 
 function formatDuration(sec: number) {
@@ -80,7 +97,7 @@ export function VideoCallModal() {
   const flushQueuedIce = useCallback((pc: RTCPeerConnection) => {
     while (queuedRemoteCandidatesRef.current.length > 0) {
       const cand = queuedRemoteCandidatesRef.current.shift()!;
-      const key = JSON.stringify(cand);
+      const key = cand.candidate || JSON.stringify(cand);
       if (!addedIceRef.current.has(key)) {
         addedIceRef.current.add(key);
         pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
@@ -95,33 +112,71 @@ export function VideoCallModal() {
         return null;
       }
 
+      const audioConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+
       let stream: MediaStream | null = null;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-          video: mode === 'video',
+          audio: audioConstraints,
+          video:
+            mode === 'video'
+              ? {
+                  facingMode: 'user',
+                  width: { ideal: 1280, max: 1920 },
+                  height: { ideal: 720, max: 1080 },
+                }
+              : false,
         });
       } catch (err) {
-        console.warn('[WebRTC] Media error:', err);
+        console.warn('[WebRTC] High-res camera failed, trying relaxed constraints:', err);
         if (mode === 'video') {
-          // Camera might be in use by another tab or process; try audio-only fallback
           try {
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-            setCamOff(true);
-            setMediaError('Camera unavailable or in use; connected in voice mode.');
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: audioConstraints,
+              video: { facingMode: 'user' },
+            });
+          } catch {
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({
+                audio: audioConstraints,
+                video: true,
+              });
+            } catch {
+              // Try audio-only fallback
+              try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                  audio: audioConstraints,
+                  video: false,
+                });
+                setCamOff(true);
+                setMediaError('Camera unavailable or in use; connected in voice mode.');
+              } catch {
+                setMediaError('Unable to access microphone or camera. Please check permissions.');
+                return null;
+              }
+            }
+          }
+        } else {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: audioConstraints,
+              video: false,
+            });
           } catch {
             setMediaError('Unable to access microphone. Please check permissions.');
             return null;
           }
-        } else {
-          setMediaError('Unable to access microphone. Please check permissions.');
-          return null;
         }
       }
 
       localStreamRef.current = stream;
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(() => undefined);
       }
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
@@ -131,6 +186,7 @@ export function VideoCallModal() {
       remoteStreamRef.current = remoteStream;
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStream;
+        remoteVideoRef.current.play().catch(() => undefined);
       }
 
       stream.getTracks().forEach((track) => {
@@ -138,11 +194,20 @@ export function VideoCallModal() {
       });
 
       pc.ontrack = (event) => {
-        event.streams[0]?.getTracks().forEach((track) => {
-          remoteStream.addTrack(track);
-        });
+        if (event.streams && event.streams[0]) {
+          event.streams[0].getTracks().forEach((track) => {
+            if (!remoteStream.getTracks().some((t) => t.id === track.id)) {
+              remoteStream.addTrack(track);
+            }
+          });
+        } else if (event.track) {
+          if (!remoteStream.getTracks().some((t) => t.id === event.track.id)) {
+            remoteStream.addTrack(event.track);
+          }
+        }
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream;
+          remoteVideoRef.current.play().catch(() => undefined);
         }
       };
 
@@ -156,10 +221,40 @@ export function VideoCallModal() {
         }
       };
 
+      pc.oniceconnectionstatechange = () => {
+        console.log('[WebRTC] ICE Connection State:', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'failed') {
+          if (typeof pc.restartIce === 'function') {
+            pc.restartIce();
+          }
+        }
+      };
+
       return pc;
     },
     []
   );
+
+  // Sync streams to video elements continuously whenever modal is open
+  useEffect(() => {
+    if (!callModalOpen) return;
+    if (
+      localVideoRef.current &&
+      localStreamRef.current &&
+      localVideoRef.current.srcObject !== localStreamRef.current
+    ) {
+      localVideoRef.current.srcObject = localStreamRef.current;
+      localVideoRef.current.play().catch(() => undefined);
+    }
+    if (
+      remoteVideoRef.current &&
+      remoteStreamRef.current &&
+      remoteVideoRef.current.srcObject !== remoteStreamRef.current
+    ) {
+      remoteVideoRef.current.srcObject = remoteStreamRef.current;
+      remoteVideoRef.current.play().catch(() => undefined);
+    }
+  });
 
   // Start outgoing call when modal opens without an incoming call
   useEffect(() => {
@@ -223,26 +318,29 @@ export function VideoCallModal() {
   // Apply remote SDP answer & ICE candidates
   useEffect(() => {
     if (!activeCall || !activeCall.id || !activeMember) return;
-    const pc = pcRef.current;
-    if (!pc) return;
 
     if (
       activeCall.callerId === activeMember &&
       activeCall.answer &&
-      !pc.currentRemoteDescription
+      pcRef.current &&
+      !pcRef.current.currentRemoteDescription
     ) {
-      pc.setRemoteDescription(new RTCSessionDescription(activeCall.answer))
-        .then(() => flushQueuedIce(pc))
-        .catch(() => undefined);
+      pcRef.current
+        .setRemoteDescription(new RTCSessionDescription(activeCall.answer))
+        .then(() => {
+          if (pcRef.current) flushQueuedIce(pcRef.current);
+        })
+        .catch((err) => console.warn('[WebRTC] Answer setRemoteDescription failed:', err));
     }
 
     const remoteRole =
       activeCall.callerId === activeMember ? 'answerCandidates' : 'offerCandidates';
     return subscribeIceCandidatesSignal(activeCall.id, remoteRole, (candidates) => {
       candidates.forEach((cand) => {
-        const key = JSON.stringify(cand);
+        const key = cand.candidate || JSON.stringify(cand);
         if (addedIceRef.current.has(key)) return;
-        if (pc.remoteDescription && pc.remoteDescription.type) {
+        const pc = pcRef.current;
+        if (pc && pc.remoteDescription && pc.remoteDescription.type) {
           addedIceRef.current.add(key);
           pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => undefined);
         } else {
@@ -267,8 +365,7 @@ export function VideoCallModal() {
     if (
       callModalOpen &&
       activeCall &&
-      (activeCall.status === 'ended' || activeCall.status === 'declined') &&
-      startedOutgoingRef.current === activeCall.id
+      (activeCall.status === 'ended' || activeCall.status === 'declined')
     ) {
       cleanupMedia();
       closeCallModal();

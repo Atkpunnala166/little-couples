@@ -276,8 +276,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    case 'add_ice': {
-      if (store.iceCandidates.callId === body.callId) {
+    case 'add_ice':
+    case 'ice_candidate': {
+      if (!store.iceCandidates.callId || store.iceCandidates.callId === body.callId) {
+        store.iceCandidates.callId = body.callId;
         const role = body.role as 'offerCandidates' | 'answerCandidates';
         if (role === 'offerCandidates') {
           store.iceCandidates.offerCandidates.push(body.candidate);

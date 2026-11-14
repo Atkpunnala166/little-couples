@@ -237,7 +237,11 @@ export async function postGlobalSync(body: Record<string, unknown>) {
   fetch(RELAY_URL, {
     method: 'POST',
     body: payloadStr,
-    headers: { Title: 'OLU_EVENT' },
+    headers: {
+      Title: 'OLU_EVENT',
+      Filename: 'signal.json',
+      'Content-Type': 'application/json',
+    },
   }).catch(() => undefined);
 }
 
@@ -260,14 +264,18 @@ async function handleIncomingRelayPayload(data: Record<string, unknown>) {
   } else if (action === 'save_call' || action === 'active_call') {
     const call = (data.call || data.payload) as CallSession;
     writeLocal('active_call', call, true);
-  } else if (action === 'ice_candidate') {
-    const callId = data.callId as string;
-    const role = data.role as string;
-    const candidate = data.candidate as RTCIceCandidateInit;
+  } else if (action === 'ice_candidate' || action === 'add_ice') {
+    const callId = (data.callId || (data.payload as Record<string, unknown>)?.callId) as string;
+    const role = (data.role || (data.payload as Record<string, unknown>)?.role) as string;
+    const candidate = (data.candidate || (data.payload as Record<string, unknown>)?.candidate) as RTCIceCandidateInit;
     if (callId && role && candidate) {
       const key = `ice_${callId}_${role}`;
       const existing = readLocal<RTCIceCandidateInit[]>(key, []);
-      writeLocal(key, [...existing, candidate], true);
+      const candStr = candidate.candidate || JSON.stringify(candidate);
+      const alreadyHas = existing.some((c) => (c.candidate || JSON.stringify(c)) === candStr);
+      if (!alreadyHas) {
+        writeLocal(key, [...existing, candidate], true);
+      }
     }
   } else if (action === 'save_game' || action === 'game_state') {
     const gameId = (data.gameId || (data.payload as Record<string, unknown>)?.gameId) as string;
@@ -315,6 +323,30 @@ function initRealtimeEngines() {
   if (typeof window === 'undefined' || syncEnginesStarted) return;
   syncEnginesStarted = true;
 
+  const handleRawRelayItem = async (item: {
+    event?: string;
+    message?: string;
+    attachment?: { url?: string };
+  }) => {
+    if (!item || item.event !== 'message') return;
+    if (item.attachment?.url) {
+      try {
+        const res = await fetch(item.attachment.url, { cache: 'no-store' });
+        const inner = await res.json();
+        handleIncomingRelayPayload(inner);
+      } catch {
+        // ignore
+      }
+    } else if (item.message) {
+      try {
+        const inner = JSON.parse(item.message);
+        handleIncomingRelayPayload(inner);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   // 1. Global Realtime WebSocket Connection (< 25ms message delivery anywhere)
   let ws: WebSocket | null = null;
   const connectWs = () => {
@@ -324,10 +356,7 @@ function initRealtimeEngines() {
       ws.onmessage = (e) => {
         try {
           const parsed = JSON.parse(e.data);
-          if (parsed.event === 'message' && parsed.message) {
-            const inner = JSON.parse(parsed.message);
-            handleIncomingRelayPayload(inner);
-          }
+          handleRawRelayItem(parsed);
         } catch {
           // ignore
         }
@@ -357,10 +386,7 @@ function initRealtimeEngines() {
           if (!line.trim()) continue;
           try {
             const item = JSON.parse(line);
-            if (item.event === 'message' && item.message) {
-              const inner = JSON.parse(item.message);
-              handleIncomingRelayPayload(inner);
-            }
+            handleRawRelayItem(item);
           } catch {}
         }
       })

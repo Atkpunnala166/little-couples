@@ -129,6 +129,7 @@ export async function GET(req: NextRequest) {
   if (url.searchParams.get('stream') === 'true') {
     const clients = getSseClients();
     let clientController: ReadableStreamDefaultController | null = null;
+    let keepAlive: NodeJS.Timeout | null = null;
 
     const stream = new ReadableStream({
       start(controller) {
@@ -157,8 +158,19 @@ export async function GET(req: NextRequest) {
             })}\n\n`
           )
         );
+
+        // 15-second heartbeat so proxies/mobile connections stay alive
+        keepAlive = setInterval(() => {
+          try {
+            controller.enqueue(encoder.encode(': ping\n\n'));
+          } catch {
+            if (keepAlive) clearInterval(keepAlive);
+            if (clientController) clients.delete(clientController);
+          }
+        }, 15000);
       },
       cancel() {
+        if (keepAlive) clearInterval(keepAlive);
         if (clientController) {
           clients.delete(clientController);
         }
@@ -168,8 +180,9 @@ export async function GET(req: NextRequest) {
     return new Response(stream, {
       headers: {
         'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
+        'Cache-Control': 'no-cache, no-transform, private',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
       },
     });
   }

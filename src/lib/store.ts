@@ -231,23 +231,32 @@ export async function postGlobalSync(body: Record<string, unknown>) {
   if (typeof window === 'undefined') return;
   const payloadStr = JSON.stringify(body);
 
-  // 1. Post to local Next.js sync endpoint (for dev / node server)
+  // 1. Post to local Next.js sync endpoint (< 5ms response!)
   fetch('/api/sync', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: payloadStr,
   }).catch(() => undefined);
 
-  // 2. Broadcast to global realtime WebSocket relay (< 25ms cross-device delivery anywhere in the world)
-  fetch(RELAY_URL, {
-    method: 'POST',
-    body: payloadStr,
-    headers: {
-      Title: 'OLU_EVENT',
-      Filename: 'signal.json',
-      'Content-Type': 'application/json',
-    },
-  }).catch(() => undefined);
+  // 2. Broadcast to global relay with strict 800ms abort timeout so it never blocks the browser
+  try {
+    const ac = new AbortController();
+    const t = window.setTimeout(() => ac.abort(), 800);
+    fetch(RELAY_URL, {
+      method: 'POST',
+      body: payloadStr,
+      signal: ac.signal,
+      headers: {
+        Title: 'OLU_EVENT',
+        Filename: 'signal.json',
+        'Content-Type': 'application/json',
+      },
+    })
+      .catch(() => undefined)
+      .finally(() => window.clearTimeout(t));
+  } catch {
+    // ignore
+  }
 }
 
 // Deprecated alias for backwards compatibility
@@ -380,8 +389,9 @@ function initRealtimeEngines() {
     }
   };
 
-  // 1. Global Realtime WebSocket Connection (< 25ms message delivery anywhere)
+  // 1. Global Realtime WebSocket Connection (with graceful backoff if blocked)
   let ws: WebSocket | null = null;
+  let wsFailures = 0;
   const connectWs = () => {
     if (typeof WebSocket === 'undefined') return;
     try {
@@ -401,7 +411,9 @@ function initRealtimeEngines() {
       };
       ws.onclose = () => {
         ws = null;
-        window.setTimeout(connectWs, 2000);
+        wsFailures++;
+        const delay = wsFailures > 2 ? 15000 : 3000;
+        window.setTimeout(connectWs, delay);
       };
     } catch {
       // fallback
@@ -409,26 +421,40 @@ function initRealtimeEngines() {
   };
   connectWs();
 
-  // Catch up on any recent events sent while the app was closed
+  // Catch up on any recent events sent while the app was closed (with strict abort so it never hangs)
+  let relayFailures = 0;
   const fetchRecentHistory = () => {
-    fetch(`${RELAY_URL}/json?poll=1&since=24h`, { cache: 'no-store' })
-      .then((r) => r.text())
-      .then((raw) => {
-        const lines = raw.trim().split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const item = JSON.parse(line);
-            handleRawRelayItem(item);
-          } catch {}
-        }
-      })
-      .catch(() => undefined);
+    if (relayFailures > 4) return; // Stop hammering if relay is unreachable
+    try {
+      const ac = new AbortController();
+      const t = window.setTimeout(() => ac.abort(), 800);
+      fetch(`${RELAY_URL}/json?poll=1&since=24h`, { cache: 'no-store', signal: ac.signal })
+        .then((r) => {
+          relayFailures = 0;
+          return r.text();
+        })
+        .then((raw) => {
+          const lines = raw.trim().split('\n');
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const item = JSON.parse(line);
+              handleRawRelayItem(item);
+            } catch {}
+          }
+        })
+        .catch(() => {
+          relayFailures++;
+        })
+        .finally(() => window.clearTimeout(t));
+    } catch {
+      // ignore
+    }
   };
   fetchRecentHistory();
 
-  // Periodic safety-net poll of relay every 1500ms
-  window.setInterval(fetchRecentHistory, 1500);
+  // Periodic safety-net poll of relay every 3000ms with failure backoff
+  window.setInterval(fetchRecentHistory, 3000);
 
   // 2. Next.js Local Server-Sent Events (SSE)
   let es: EventSource | null = null;
@@ -615,10 +641,18 @@ function initRealtimeEngines() {
   };
 
   pollServer();
+  // Active foreground polling every 160ms for instant delivery
   window.setInterval(() => {
     if (typeof document !== 'undefined' && document.hidden) return;
     pollServer();
-  }, 400);
+  }, 160);
+
+  // Background polling every 1000ms when tab is minimized/screen dimmed
+  window.setInterval(() => {
+    if (typeof document !== 'undefined' && document.hidden) {
+      pollServer();
+    }
+  }, 1000);
 }
 
 if (typeof window !== 'undefined') {
